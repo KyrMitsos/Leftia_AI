@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+src/betfairAPI/creds.json
+src/betfairAPI/*.crt
+src/betfairAPI/*.key
+
+*_results.csv
+*_dump.csv
+*_dump.json
+*_run_dump.json
+*_log.txt

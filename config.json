@@ -1,0 +1,11 @@
+{
+    "Bet_Size": 2.0,
+    "Excluded_Markets": [
+        "Italian Serie D"
+    ],
+    "Excluded_Competitions": [
+        "Friendly Matches"
+    ],
+    "Live": false,
+    "tipota": 1.0
+}

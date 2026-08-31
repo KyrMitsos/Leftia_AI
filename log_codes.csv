@@ -1,0 +1,11 @@
+key,code,description
+bad_market,BAD,Implausible market
+retry_recovered,RET,Recovered by repeat poll
+mixed_recovery,MIX,Recovered from adjacent polls
+inferred_price,INF,Price inferred from spread history
+missing_price,MISS,No reliable price
+http_problem,HTTP,HTTP or source problem
+auth_recovery,AUTH,Session recovery
+finished_corner,FT,Finished match corner case
+late_start,LATE,Match first seen after kick off
+last_good,LAST,Used last consistent observed market
