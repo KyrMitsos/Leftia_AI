@@ -9,3 +9,10 @@ auth_recovery,AUTH,Session recovery
 finished_corner,FT,Finished match corner case
 late_start,LATE,Match first seen after kick off
 last_good,LAST,Used last consistent observed market
+catalogue_missing,CATMISS,Tracked event disappeared from catalogue
+catalogue_returned,CATRET,Tracked event returned to catalogue
+timeline_missing,TLMISS,Tracked event disappeared from timeline feed
+timeline_returned,TLRET,Tracked event returned to timeline feed
+second_half_fallback,SHFB,Second half start recovered from strong fallback evidence
+first_half_fallback,KOFB,First half start recovered from strong fallback evidence
+ht_capture_diagnostic,HTDBG,HT boundary capture diagnostic

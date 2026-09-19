@@ -1,4 +1,4 @@
-Leftia_AI v0.1.7
+Leftia_AI v0.1.6
 
 Separate experimental version of the original Leftia collector.
 The existing 25 output columns are unchanged.
@@ -11,7 +11,7 @@ Collection and recovery:
 - The wider 30-second reconciliation period remains only to resolve source timing disagreement and missing pre-play state; it does not license taking ordinary later in-play odds as KO.
 - Pre-KO polling continues for delayed starts until the actual start is observed (bounded by the existing 20-minute near-start watch).
 - A match first rediscovered materially late is never assigned current late-match prices as KO.
-- HT is the first kosher customer-facing price at the second-half restart boundary. One price request is made immediately at SecondHalfKickOff. If that response is missing or incoherent, HT remains pending and is retried every 5 seconds for at most 20 seconds while the score still equals the recorded HT score and no second-half goal has occurred.
+- HT is the first kosher customer-facing price at the second-half restart boundary. The first available in-play website snapshot within 30 seconds of that boundary is eligible; only a 2-second immediate retry cluster can repair a bad first observation, so the collector never drifts minutes into the second half to manufacture HT.
 - A genuine SecondHalfKickOff marker with a valid timestamp supplies the HT boundary directly. If Betfair gives the marker a 1970 timestamp, elapsed time is used only as phase corroboration: the wall-clock HT boundary must come from the observed half-time market reopening.
 - HT market-reopen fallback no longer requires a clean observation before the half-time suspension; repeated suspension plus a timely in-play reopen is enough strong evidence.
 - A separate small clean-price history survives suspended/corrupt half-time polls and is checkpointed for restart-safe BACK/LAY inference.
@@ -27,7 +27,7 @@ Collection and recovery:
 - Missing intermediate match states do not block later valid states such as SecondHalfKickOff or Finished.
 - A populated Betfair fullTimeScore is also accepted as strong final-state evidence.
 - Complete broadly plausible first price snapshots are accepted even when no recent clean-book history yet exists.
-- Generic website recovery remains conservative. HT boundary replenishment is separate: one immediate request then at most one fresh request every 5 seconds inside the fixed 20-second restart window.
+- Rapid website recovery is capped at one immediate retry per focused cycle; further recovery uses the normal 15-second focused cycle instead of a five-request burst.
 
 Restart safety:
 - YYYYMMDD_run_dump.json remains in use.
@@ -83,15 +83,3 @@ v0.1.6 HT boundary patch
 - Late second-half discovery never backfills HT.
 - Existing KO boundary behaviour and Match Odds 1.01/1000 limit inference are unchanged.
 
-
-
-v0.1.7 HT replenishment patch
-------------------------------
-- Keeps the v0.1.6 phase-signal and KO logic unchanged.
-- Removes the tight sub-second HT retry burst.
-- SecondHalfKickOff still triggers one immediate fresh Match Odds request.
-- If that first response is unusable, HT remains pending instead of being frozen immediately to 0/0/0.
-- Pending HT is retried at 5-second spacing for a maximum 20-second fixed boundary window.
-- Each retry requires a fresh timeline for that event. If the score differs from the recorded HT score or a second-half goal is recorded, capture stops and HT is left missing.
-- After the 20-second window, HT is frozen missing; later second-half prices are never backfilled as HT.
-- Pending HT markets are excluded from generic focused price polling so the collector does not duplicate requests.

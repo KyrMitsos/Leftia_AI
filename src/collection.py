@@ -107,6 +107,11 @@ def market_snapshot(event_node, market_id, selection_ids):
         back.append(best_price(exchange, 'availableToBack'))
         lay.append(best_price(exchange, 'availableToLay'))
 
+    state = market.get('state', {}) if isinstance(market, dict) else {}
+    inplay = state.get('inplay')
+    if inplay is None:
+        inplay = state.get('inPlay')
+
     return {
         'event_id': normalise_id(event_node.get('eventId')),
         'market_id': normalise_id(market_id),
@@ -114,6 +119,8 @@ def market_snapshot(event_node, market_id, selection_ids):
         'lay': lay,
         'exchanges': exchanges,
         'book': book_sum(back),
+        'inplay': inplay,
+        'status': state.get('status'),
     }
 
 
@@ -155,6 +162,27 @@ def _tick_distance(a, b):
         return 9999
     return abs(ai - bi)
 
+
+
+def boundary_snapshots_close(first, second, max_runner_ticks=2, max_total_ticks=4, max_book_delta=0.03):
+    if first is None or second is None:
+        return False
+    first_back = first.get('back', [])
+    second_back = second.get('back', [])
+    if len(first_back) != 3 or len(second_back) != 3:
+        return False
+    if any(value is None or value <= 1.0 for value in first_back + second_back):
+        return False
+    distances = [_tick_distance(a, b) for a, b in zip(first_back, second_back)]
+    if any(distance > max_runner_ticks for distance in distances):
+        return False
+    if sum(distances) > max_total_ticks:
+        return False
+    first_book = book_sum(first_back)
+    second_book = book_sum(second_back)
+    if first_book is None or second_book is None:
+        return False
+    return abs(first_book - second_book) <= max_book_delta
 
 def mix_candidates(candidates, history):
     target = expected_book(history)
@@ -216,6 +244,52 @@ def infer_back_from_lay(lay, history, runner_index):
     return move_ticks(lay, -spread)
 
 
+def infer_back_from_partial_book(snapshot, history, runner_index, max_ticks=12):
+    """Infer one missing BACK from its LAY and the other two BACK prices.
+
+    This is deliberately conservative. It is mainly for boundary books such as
+    LAY 1.01 with no BACK while the other two runners are very large.
+    """
+    if snapshot is None:
+        return None
+    backs = list(snapshot.get('back', []))
+    lays = list(snapshot.get('lay', []))
+    if len(backs) != 3 or len(lays) != 3:
+        return None
+    if sum(value is None for value in backs) != 1 or backs[runner_index] is not None:
+        return None
+
+    lay = lays[runner_index]
+    lay_index = _ladder_index(lay)
+    if lay_index is None:
+        return None
+    if any(backs[index] is None or backs[index] <= 1.0 for index in range(3) if index != runner_index):
+        return None
+
+    target = expected_book(history)
+    anchor = _runner_anchor(history, runner_index)
+    best = None
+    for ticks in range(0, min(max_ticks, lay_index) + 1):
+        candidate = move_ticks(lay, -ticks)
+        if candidate is None or candidate <= 1.0 or candidate > lay:
+            continue
+        prices = list(backs)
+        prices[runner_index] = candidate
+        book = book_sum(prices)
+        if book is None or not BOOK_MIN <= book <= BOOK_MAX:
+            continue
+
+        # Prefer a coherent whole book, then a price close to the available LAY.
+        # If a recent clean runner anchor exists, use it as additional evidence.
+        score = abs(book - target) + (0.002 * ticks)
+        if anchor is not None:
+            score += 0.02 * min(_tick_distance(candidate, anchor), 25) / 25.0
+        if best is None or score < best['score']:
+            best = {'price': candidate, 'book': book, 'score': score}
+
+    return best
+
+
 def repair_missing_back(snapshot, history):
     if snapshot is None:
         return None
@@ -226,6 +300,9 @@ def repair_missing_back(snapshot, history):
     for runner_index in range(3):
         if prices[runner_index] is None:
             inferred = infer_back_from_lay(snapshot.get('lay', [None, None, None])[runner_index], history, runner_index)
+            if inferred is None:
+                partial = infer_back_from_partial_book(snapshot, history, runner_index)
+                inferred = partial['price'] if partial is not None else None
             if inferred is not None:
                 prices[runner_index] = inferred
                 changed.append((runner_index, inferred))
@@ -234,6 +311,76 @@ def repair_missing_back(snapshot, history):
         return None
     return {'back': prices, 'book': book, 'inferred': changed}
 
+
+
+def repair_match_odds_boundary(snapshot, history, longshot_floor=100.0):
+    """Complete genuine Match Odds boundary books without inventing mid-range prices.
+
+    Betfair can leave one side empty when an outcome is effectively at an
+    exchange limit.  For an otherwise coherent open market we represent that
+    missing liquidity at 1.01 or 1000.0.  This helper is for MATCH_ODDS only;
+    it must not be used to manufacture prices for settled/impossible OU lines.
+    """
+    if snapshot is None:
+        return None
+
+    status = str(snapshot.get('status') or '').upper()
+    if status in {'SUSPENDED', 'CLOSED'}:
+        return None
+
+    backs = list(snapshot.get('back', []))
+    lays = list(snapshot.get('lay', []))
+    if len(backs) != 3 or len(lays) != 3:
+        return None
+
+    inferred = []
+
+    repaired = repair_missing_back(snapshot, history)
+    if repaired is not None:
+        backs = list(repaired['back'])
+        inferred.extend(('back', index, value) for index, value in repaired.get('inferred', []))
+    elif any(value is None for value in backs):
+        # Exact exchange-limit quotes on the opposite side are strong evidence
+        # for the same boundary price when that completes a coherent book.
+        trial = list(backs)
+        trial_inferred = []
+        for index, value in enumerate(trial):
+            if value is not None:
+                continue
+            lay = lays[index]
+            if lay == 1.01:
+                trial[index] = 1.01
+                trial_inferred.append(('back', index, 1.01))
+            elif lay == 1000.0:
+                trial[index] = 1000.0
+                trial_inferred.append(('back', index, 1000.0))
+        if book_is_plausible(trial):
+            backs = trial
+            inferred.extend(trial_inferred)
+
+    if not book_is_plausible(backs):
+        return None
+
+    # Missing LAY liquidity at the hard limits is represented by the hard
+    # limit itself.  Mid-range missing lays remain missing; we do not invent
+    # an ordinary spread just to make the row complete.
+    for index, lay in enumerate(lays):
+        if lay is not None:
+            continue
+        back = backs[index]
+        if back == 1.01:
+            lays[index] = 1.01
+            inferred.append(('lay', index, 1.01))
+        elif back is not None and back >= longshot_floor:
+            lays[index] = 1000.0
+            inferred.append(('lay', index, 1000.0))
+
+    return {
+        'back': backs,
+        'lay': lays,
+        'book': book_sum(backs),
+        'inferred': inferred,
+    }
 
 def repair_suspect_back(prices, candidates, history):
     clean = recent_clean(history)

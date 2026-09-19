@@ -63,3 +63,13 @@ def expiredMatch(match, today_datetime, delta_hours):
     threshold_datetime = (match_datetime + betfairAPI.datetime.timedelta(hours=delta_hours))
     return threshold_datetime < today_datetime
 
+
+
+def saveToJSONWithBackup(data, filename):
+    temp_filename = filename + ".tmp"
+    backup_filename = filename + ".bak"
+    with open(temp_filename, 'w') as outfile:
+        json.dump(data, outfile, separators=(',', ':'))
+    if os.path.isfile(filename):
+        os.replace(filename, backup_filename)
+    os.replace(temp_filename, filename)

@@ -8,5 +8,9 @@ src/betfairAPI/*.key
 *_results.csv
 *_dump.csv
 *_dump.json
+*_dump_state.json
 *_run_dump.json
+*_checkpoint.json
+*_checkpoint.json.bak
+*_checkpoint.json.tmp
 *_log.txt
