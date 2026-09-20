@@ -14,3 +14,9 @@ src/betfairAPI/*.key
 *_checkpoint.json.bak
 *_checkpoint.json.tmp
 *_log.txt
+
+live_state.json
+live_state.json.bak
+live_state.json.tmp
+*_dump.json.bak
+*_dump.json.tmp

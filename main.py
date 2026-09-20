@@ -6,12 +6,15 @@ from requests.structures import CaseInsensitiveDict
 import src.betfairAPI.betfairAPI as betfairAPI
 import src.ufuncs as lib
 import src.collection as collection
+import src.state_store as state_store
 from functools import reduce
 from tabulate import tabulate
 import io
 import time
 import copy  # for copy.deepcopy
 import traceback
+import statistics
+import math
 from zoneinfo import ZoneInfo
 
 # To append a dict to a csv (i.e. how I will keep stats of trades)
@@ -51,6 +54,7 @@ from zoneinfo import ZoneInfo
 
 def _requestEventTimelinesRaw(eventIDs):
     event_time_lines = None
+    requested_count = len(eventIDs)
     eventIDs = ','.join(eventIDs)
 
     url = f"https://ips.betfair.com/inplayservice/v1/eventTimelines?_ak=nzIFcwyWhrlwYMrh&alt=json&eventIds={eventIDs}&locale=en_GB"
@@ -71,7 +75,7 @@ def _requestEventTimelinesRaw(eventIDs):
         try:
             event_time_lines_response = requests.get(url, headers=headers, timeout=10)
             event_time_lines_response.raise_for_status()
-            print(f'Success!\nGET Status: {event_time_lines_response.status_code}')
+            print(f'Timeline GET {event_time_lines_response.status_code}: requested={requested_count}')
             event_time_lines = lib.json.loads(event_time_lines_response.text)
             break
         except betfairAPI.HTTPError as http_err:
@@ -92,6 +96,7 @@ def _requestEventTimelinesRaw(eventIDs):
 
 def _requestPricesFromWebsiteRaw(marketIDs):
     exchange_prices = None
+    requested_count = len([item for item in str(marketIDs).split(',') if item])
     url = f"https://ero.betfair.com/www/sports/exchange/readonly/v1/bymarket?_ak=nzIFcwyWhrlwYMrh&alt=json&currencyCode=GBP&locale=en_GB&marketIds={marketIDs}&rollupLimit=2&rollupModel=STAKE&types=MARKET_STATE,RUNNER_STATE,RUNNER_EXCHANGE_PRICES_BEST"
 
     headers = CaseInsensitiveDict()
@@ -109,7 +114,7 @@ def _requestPricesFromWebsiteRaw(marketIDs):
     try:
         exchange_prices_response = requests.get(url, headers=headers, timeout=10)
         exchange_prices_response.raise_for_status()
-        print(f'Success!\nGET Status: {exchange_prices_response.status_code}')
+        print(f'Price GET {exchange_prices_response.status_code}: markets={requested_count}')
         exchange_prices = lib.json.loads(exchange_prices_response.text)
     except betfairAPI.HTTPError as http_err:
         status = http_err.response.status_code if http_err.response is not None else None
@@ -192,24 +197,31 @@ def saveDictArrayToCSV(filename, dictArray, mode='w'):
     try:
         file_exists = os.path.isfile(filename)
 
-        if (dictArray is not None):
-            keys = list(dictArray[0].keys())
+        if dictArray is not None:
+            # Results CSV column order is part of the file format. Never derive it
+            # from a restored/migrated dictionary because JSON key order may differ.
+            keys = list(lib.eventTemplateKeys)
 
-            # Open your CSV file in append mode
-            # Create a file object for this file
-            with io.open(filename, mode, encoding="utf-8") as f_object:
-                # Pass the file object and a list
-                # of column names to DictWriter()
-                # You will get a object of DictWriter
-                dictwriter_object = csv.DictWriter(f_object, fieldnames=keys, lineterminator='\r')
+            if file_exists and 'a' in mode:
+                with io.open(filename, 'r', encoding='utf-8', newline='') as infile:
+                    existing_header = next(csv.reader(infile), [])
+                if existing_header != keys:
+                    raise ValueError(
+                        f"results header mismatch in {filename}; refusing unsafe append"
+                    )
 
-                # Write the Header first
-                if not file_exists:
+            with io.open(filename, mode, encoding="utf-8", newline='') as f_object:
+                dictwriter_object = csv.DictWriter(
+                    f_object, fieldnames=keys, extrasaction='ignore', lineterminator='\r'
+                )
+
+                if not file_exists or 'w' in mode:
                     dictwriter_object.writeheader()
 
-                for dict in dictArray:
-                    # Pass the dictionary as an argument to the Writerow()
-                    dictwriter_object.writerow(roundOutputDecimals(dict.copy()))
+                for item in dictArray:
+                    source = roundOutputDecimals(canonicalOutput(item))
+                    row = {key: source.get(key, '') for key in keys}
+                    dictwriter_object.writerow(row)
 
                 result = True
     except Exception as err:
@@ -354,8 +366,6 @@ if config is None:
 # Session token is maintained by src.betfairAPI.betfairAPI
 
 filename = ""
-timeDeltaHours = 4
-todays_threshold = betfairAPI.datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + betfairAPI.datetime.timedelta(hours=(24 + timeDeltaHours))
 DA_TEAMS = []
 outputTemplate = lib.render(["", "", "", "",    # "Date", "Competition", "Home", "Away"
                              "", "", "", "",    # "HT_Home", "HT_Away", "FT_Home", "FT_Away"
@@ -366,6 +376,36 @@ outputTemplate = lib.render(["", "", "", "",    # "Date", "Competition", "Home",
                              "", 0.0, 0.0,    # "MODEL_DT1", "MULTI_DT1", "P/L_DT1"
                              "", 0.0, 0.0,    # "MODEL_ZZCX", "MULTI_ZZCX", "P/L_ZZCX"
                              ])
+
+
+RESULT_FIELDS = list(lib.eventTemplateKeys)
+
+
+def canonicalOutput(source):
+    """Return the 25 result fields in the one authoritative order.
+
+    This is structural normalisation for live/in-memory state and new writes only.
+    It does not inspect, rewrite or repair historical results CSV files.
+    """
+    source = source if isinstance(source, dict) else {}
+    return {key: copy.deepcopy(source.get(key, outputTemplate.get(key, ''))) for key in RESULT_FIELDS}
+
+
+def normaliseTeamOutput(team):
+    if not isinstance(team, dict):
+        return False
+    current = team.get('output', {})
+    canonical = canonicalOutput(current)
+    changed = not isinstance(current, dict) or list(current.keys()) != RESULT_FIELDS or current != canonical
+    team['output'] = canonical
+    return changed
+
+
+def normaliseMatchRecordOutput(record):
+    if not isinstance(record, dict):
+        return record
+    record['o'] = canonicalOutput(record.get('o', {}))
+    return record
 
 
 # Manual setting of Soccer ID
@@ -431,21 +471,40 @@ soccerEventTypeID = '1'  # '1' Corresponds to Soccer
 # -----------------------------------------------------
 
 
-NORMAL_DELAY = 30
-FOCUSED_DELAY = 15
-KO_FOCUS_BEFORE_MINUTES = 5
+STANDARD_INTERVAL = 30
+INTERMEDIATE_INTERVAL = 10
+NORMAL_DELAY = STANDARD_INTERVAL
+FOCUSED_DELAY = INTERMEDIATE_INTERVAL
+KO_FOCUS_BEFORE_MINUTES = 3
 KO_BACKUP_MAX_AGE_SECONDS = 180
 KO_KEEP_AFTER_SCHEDULE_MINUTES = 20
-KO_POST_BOUNDARY_SECONDS = 8
-KO_BOUNDARY_RECONCILE_SECONDS = 30
+# Price collection remains on the ordinary 30-second cadence. Allow enough
+# time for the first standard cycle after a real kick-off observation.
+KO_POST_BOUNDARY_SECONDS = STANDARD_INTERVAL + 10
+KO_BOUNDARY_RECONCILE_SECONDS = KO_POST_BOUNDARY_SECONDS + 5
 KO_LIVE_DISCOVERY_MAX_AFTER_SCHEDULE_SECONDS = 120
 KO_LIVE_ELAPSED_MAX_MINUTES = 3
+KO_SYNTHETIC_START_SOURCES = {
+    'catalogue_inplay_live', 'catalogue_inplay_late', 'late_rediscovery', 'catalogue_inplay'
+}
+KO_START_SOURCE_PRIORITY = {
+    'catalogue_inplay_late': 0,
+    'late_rediscovery': 0,
+    'catalogue_inplay': 0,
+    'catalogue_inplay_live': 1,
+    'status_observed': 2,
+    'explicit_observed': 3,
+    'explicit_time': 4,
+}
 FORENSIC_MAX_SNAPSHOTS = 8
 HT_FOCUS_AFTER_FIRST_HALF_MINUTES = 0
 HT_MARKET_REOPEN_MINUTES = 12
 HT_BOUNDARY_CAPTURE_SECONDS = 3
-HT_REPLENISH_POLL_SECONDS = 5
-HT_REPLENISH_WINDOW_SECONDS = 20
+HT_REPLENISH_POLL_SECONDS = INTERMEDIATE_INTERVAL
+HT_REPLENISH_WINDOW_SECONDS = 21
+DAY_CLOSE_GRACE_HOURS = 4
+FINAL_RECOVERY_AFTER_START_SECONDS = 3 * 60 * 60
+FINAL_RECOVERY_MAX_ATTEMPTS = 2
 RECOVERY_RETRIES = 1
 RECOVERY_WAIT = 0.5
 TIMELINE_BATCH_SIZE = 50
@@ -465,6 +524,9 @@ FIRST_HALF_END_SCORES = {}
 SECOND_HALF_START_TIMES = {}
 SECOND_HALF_START_SOURCE = {}
 HT_REPLENISH_LAST_ATTEMPT = {}
+# Latest complete/plausible 30-second snapshot observed during the half-time recess.
+# This is reference/forensic state only; HT output still requires a post-restart capture.
+HT_RECESS_STATE = {}
 NEAR_START_CATALOGUE = {}
 CURRENT_INPLAY_CATALOGUE = {}
 LATEST_TIMELINES = {}
@@ -477,10 +539,16 @@ LAST_TIMELINE_SEEN = {}
 HT_CLEAN_SEEN = set()
 HT_UNAVAILABLE_COUNTS = {}
 HT_LAST_UNAVAILABLE_TIMES = {}
+FINAL_RECOVERY_STATE = {}
 FINALIZED_MARKETS = set()
 RESULT_KEYS = {}
 LOG_CODES = {}
 STATE_DIRTY = False
+LIVE_STATE_FILE = 'live_state.json'
+LIVE_STATE_SCHEMA = 2
+LAST_SAVED_STATE_HASH = None
+LIVE_STATE_RESTORED_FROM_BACKUP = False
+LOG_LAST_STATE = {}
 
 
 def markStateDirty():
@@ -491,7 +559,8 @@ def markStateDirty():
 def loadLogCodes():
     codes = {}
     try:
-        with open('log_codes.csv', mode='r', encoding='utf-8') as infile:
+        legend = 'codes.csv' if os.path.isfile('codes.csv') else 'log_codes.csv'
+        with open(legend, mode='r', encoding='utf-8') as infile:
             for row in csv.DictReader(infile):
                 codes[row['key']] = row['code']
     except Exception as err:
@@ -514,6 +583,37 @@ def parseBetfairTimestamp(value):
 def currentUKDay(offset_days=0):
     now = betfairAPI.datetime.datetime.now(ZoneInfo('Europe/London')) + betfairAPI.datetime.timedelta(days=offset_days)
     return now.strftime('%Y%m%d')
+
+
+def currentUTCDay(offset_days=0):
+    now = betfairAPI.datetime.datetime.now(betfairAPI.datetime.timezone.utc) + betfairAPI.datetime.timedelta(days=offset_days)
+    return now.strftime('%Y%m%d')
+
+
+def matchStartDay(team):
+    if not isinstance(team, dict):
+        return None
+    values = [
+        team.get('output', {}).get('Date'),
+        team.get('event', {}).get('openDate'),
+        team.get('description', {}).get('marketTime')
+    ]
+    for value in values:
+        epoch = parseBetfairTimestamp(value)
+        if epoch is not None:
+            return betfairAPI.datetime.datetime.fromtimestamp(
+                epoch, betfairAPI.datetime.timezone.utc).strftime('%Y%m%d')
+    return None
+
+
+def dayCloseEpoch(day):
+    try:
+        start = betfairAPI.datetime.datetime.strptime(day, '%Y%m%d').replace(
+            tzinfo=betfairAPI.datetime.timezone.utc)
+    except Exception:
+        return None
+    return (start + betfairAPI.datetime.timedelta(
+        days=1, hours=DAY_CLOSE_GRACE_HOURS)).timestamp()
 
 
 def orderedCatalogueRunners(entry):
@@ -655,6 +755,83 @@ def observedKickoffTime(event, now_epoch=None):
         return now_epoch - ((elapsed or 0) * 60), 'status_observed'
     return None, None
 
+
+def koStartSourceReliable(source):
+    return bool(source) and source not in KO_SYNTHETIC_START_SOURCES
+
+
+def reconcileTimelineKickOff(event, now_epoch=None):
+    """Replace a synthetic/approximate KO boundary when better timeline evidence arrives.
+
+    This is deliberately allowed to reopen a KO previously marked MISSING. A
+    temporary catalogue fallback must never make a later exact KickOff timestamp
+    unusable (the delayed-kick-off failure seen in Ascoli v Avellino).
+    """
+    now_epoch = now_epoch or time.time()
+    event_id = collection.normalise_id(event.get('eventId')) if isinstance(event, dict) else ''
+    if not event_id:
+        return False
+
+    observed_start, observed_source = observedKickoffTime(event, now_epoch)
+    if observed_start is None or not observed_source:
+        return False
+
+    current_start = FIRST_HALF_START_TIMES.get(event_id)
+    current_source = FIRST_HALF_START_SOURCE.get(event_id)
+    current_rank = KO_START_SOURCE_PRIORITY.get(current_source, 1 if koStartSourceReliable(current_source) else 0)
+    observed_rank = KO_START_SOURCE_PRIORITY.get(observed_source, 1 if koStartSourceReliable(observed_source) else 0)
+
+    replace = current_start is None
+    if not replace and observed_rank > current_rank:
+        replace = True
+    if not replace and current_source in KO_SYNTHETIC_START_SOURCES and observed_source not in KO_SYNTHETIC_START_SOURCES:
+        replace = True
+
+    if not replace:
+        return False
+
+    previous_source = current_source
+    FIRST_HALF_START_TIMES[event_id] = observed_start
+    FIRST_HALF_START_SOURCE[event_id] = observed_source
+
+    team = findTeamByEvent(event_id)
+    if team is not None:
+        market_id = getMarketID(team)
+        state = KO_CAPTURE_STATE.setdefault(market_id, {})
+        previous_phase = state.get('phase')
+        state.update({
+            'event_id': event_id,
+            'start': observed_start,
+            'source': observed_source,
+            'deadline': observed_start + KO_BOUNDARY_RECONCILE_SECONDS,
+            'observed_at': now_epoch,
+        })
+
+        # A synthetic boundary may have expired before Betfair's timeline became
+        # available. Reopen that MISS and re-run selection against the stored
+        # 30-second price history around the real boundary.
+        if previous_phase == 'MISSING' and (
+                previous_source in KO_SYNTHETIC_START_SOURCES or observed_rank > current_rank):
+            KO_MISSING.discard(market_id)
+            state['phase'] = 'RECOVERY'
+            evidence = CAPTURE_EVIDENCE.get(market_id)
+            if isinstance(evidence, dict):
+                ko_evidence = evidence.get('KO')
+                if isinstance(ko_evidence, dict) and ko_evidence.get('method') == 'MISS':
+                    evidence.pop('KO', None)
+
+        # Compatibility with a state produced by the older collector: if a KO
+        # was already frozen against a synthetic scheduled/catalogue boundary,
+        # replace it only when the stored price history can prove a valid boundary
+        # around the newly observed real kick-off. Otherwise retain the old value.
+        elif previous_phase == 'FROZEN' and previous_source in KO_SYNTHETIC_START_SOURCES:
+            corrected, _ = selectKOBoundary(team, observed_start, now_epoch)
+            if corrected is not None:
+                freezeKO(team, corrected)
+
+    markStateDirty()
+    return True
+
 def findTeamByEvent(event_id):
     return next((team for team in DA_TEAMS if collection.same_id(team.get('event', {}).get('id'), event_id)), None)
 
@@ -690,28 +867,36 @@ def logIssue(entry, key, point='', detail=''):
         LOG_CODES = loadLogCodes()
 
     if 'output' in entry:
-        timestamp = entry['output'].get('Date', '')
+        match_date = entry['output'].get('Date', '')
         home = entry['output'].get('Home', '')
         away = entry['output'].get('Away', '')
     else:
-        timestamp = entry.get('event', {}).get('openDate', '')
+        match_date = entry.get('event', {}).get('openDate', '')
         home, away = getHomeAway(entry)
 
-    date_epoch = parseBetfairTimestamp(timestamp)
+    date_epoch = parseBetfairTimestamp(match_date)
     if date_epoch is not None:
         date = betfairAPI.datetime.datetime.fromtimestamp(date_epoch, betfairAPI.datetime.timezone.utc).strftime('%Y%m%d')
     else:
-        date = currentUKDay()
+        date = currentUTCDay()
+
+    code = LOG_CODES.get(key, key)
+    event_id = getEventID(entry) if isinstance(entry, dict) else ''
+    state_key = (event_id, point)
+    state_value = (code, str(detail))
+    if LOG_LAST_STATE.get(state_key) == state_value:
+        return
+    LOG_LAST_STATE[state_key] = state_value
 
     filename = f"{date}_log.txt"
     file_exists = os.path.isfile(filename)
-    code = LOG_CODES.get(key, key)
+    at_utc = betfairAPI.datetime.datetime.now(betfairAPI.datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     with open(filename, mode='a', encoding='utf-8', newline='') as outfile:
         writer = csv.writer(outfile, lineterminator='\n')
         if not file_exists:
-            writer.writerow(['Timestamp', 'Home', 'Away', 'Code', 'Point', 'Details'])
-        writer.writerow([timestamp, home, away, code, point, detail])
-    print(f"{timestamp},{home},{away},{code},{point},{detail}")
+            writer.writerow(['AtUTC', 'MatchDate', 'Home', 'Away', 'Code', 'Point', 'Details'])
+        writer.writerow([at_utc, match_date, home, away, code, point, detail])
+    print(f"{at_utc},{match_date},{home},{away},{code},{point},{detail}")
 
 
 def transitionDetail(event_details, event_type):
@@ -1124,54 +1309,365 @@ def pollEntries(entries, aggressive=False, point='', allow_history_fallback=True
     return results
 
 
-def _checkpointState():
+def _compactSnapshotForState(snapshot):
+    if not isinstance(snapshot, dict):
+        return None
+    result = {
+        't': snapshot.get('time'),
+        'b': list(snapshot.get('back', [])),
+        'l': list(snapshot.get('lay', [])),
+        'q': snapshot.get('book'),
+        'ip': snapshot.get('inplay'),
+        'st': snapshot.get('status')
+    }
+    if snapshot.get('request_time') is not None:
+        result['rq'] = snapshot.get('request_time')
+    if snapshot.get('response_time') is not None:
+        result['rs'] = snapshot.get('response_time')
+    return result
+
+
+def _expandSnapshotFromState(snapshot, event_id='', market_id=''):
+    if not isinstance(snapshot, dict):
+        return None
     return {
-        'version': 6,
-        'saved_at': betfairAPI.datetime.datetime.now(betfairAPI.datetime.timezone.utc).isoformat(),
-        'DA_TEAMS': DA_TEAMS,
-        'PRICE_HISTORY': PRICE_HISTORY,
-        'CLEAN_PRICE_HISTORY': CLEAN_PRICE_HISTORY,
-        'CAPTURE_EVIDENCE': CAPTURE_EVIDENCE,
-        'FIRST_HALF_START_TIMES': FIRST_HALF_START_TIMES,
-        'FIRST_HALF_START_SOURCE': FIRST_HALF_START_SOURCE,
-        'FIRST_HALF_END_TIMES': FIRST_HALF_END_TIMES,
-        'FIRST_HALF_END_SCORES': FIRST_HALF_END_SCORES,
-        'SECOND_HALF_START_TIMES': SECOND_HALF_START_TIMES,
-        'SECOND_HALF_START_SOURCE': SECOND_HALF_START_SOURCE,
-        'HT_REPLENISH_LAST_ATTEMPT': HT_REPLENISH_LAST_ATTEMPT,
-        'NEAR_START_CATALOGUE': NEAR_START_CATALOGUE,
-        'CURRENT_INPLAY_CATALOGUE': CURRENT_INPLAY_CATALOGUE,
-        'LATEST_TIMELINES': LATEST_TIMELINES,
-        'KO_MISSING': sorted(KO_MISSING),
-        'KO_CAPTURE_STATE': KO_CAPTURE_STATE,
-        'CATALOGUE_MISSING': sorted(CATALOGUE_MISSING),
-        'TIMELINE_MISSING': sorted(TIMELINE_MISSING),
-        'LAST_CATALOGUE_SEEN': LAST_CATALOGUE_SEEN,
-        'LAST_TIMELINE_SEEN': LAST_TIMELINE_SEEN,
-        'HT_CLEAN_SEEN': sorted(HT_CLEAN_SEEN),
-        'HT_UNAVAILABLE_COUNTS': HT_UNAVAILABLE_COUNTS,
-        'HT_LAST_UNAVAILABLE_TIMES': HT_LAST_UNAVAILABLE_TIMES,
-        'FINALIZED_MARKETS': sorted(FINALIZED_MARKETS)
+        'event_id': event_id,
+        'market_id': market_id,
+        'back': list(snapshot.get('b', [])),
+        'lay': list(snapshot.get('l', [])),
+        'book': snapshot.get('q'),
+        'inplay': snapshot.get('ip'),
+        'status': snapshot.get('st'),
+        'time': snapshot.get('t') or time.time(),
+        'request_time': snapshot.get('rq'),
+        'response_time': snapshot.get('rs')
     }
 
 
-def saveCheckpoint(force=False):
-    global STATE_DIRTY
+def _compactTimelineForState(event):
+    if not isinstance(event, dict):
+        return {}
+    score = event.get('score', {}) or {}
+    home = score.get('home', {}) or {}
+    away = score.get('away', {}) or {}
+    events = []
+    code_map = {
+        'KickOff': 'K',
+        'FirstHalfEnd': 'F',
+        'SecondHalfKickOff': 'S',
+        'Finished': 'E',
+        'SecondHalfEnd': 'E',
+        'Goal': 'G'
+    }
+    for item in event.get('updateDetails', []) or []:
+        kind = item.get('updateType') or item.get('type')
+        code = code_map.get(kind)
+        if code is None:
+            continue
+        match_time = item.get('matchTime')
+        if match_time in [None, '']:
+            match_time = item.get('elapsedRegularTime')
+        added = item.get('elapsedAddedTime')
+        side = item.get('team', '')
+        update_time = item.get('updateTime', '')
+        events.append([code, match_time, added, side, update_time])
+    return {
+        'ph': event.get('inPlayMatchStatus', ''),
+        'sc': [
+            home.get('score', ''), away.get('score', ''),
+            home.get('halfTimeScore', ''), away.get('halfTimeScore', ''),
+            home.get('fullTimeScore', ''), away.get('fullTimeScore', '')
+        ],
+        'ev': events
+    }
+
+
+def _expandTimelineFromState(record):
+    timeline = record.get('tl', {}) if isinstance(record, dict) else {}
+    score_values = list(timeline.get('sc', [])) + [''] * 6
+    home_name = record.get('h', '')
+    away_name = record.get('a', '')
+    reverse_map = {'K': 'KickOff', 'F': 'FirstHalfEnd', 'S': 'SecondHalfKickOff', 'E': 'Finished', 'G': 'Goal'}
+    details = []
+    for packed in timeline.get('ev', []) or []:
+        if not isinstance(packed, list) or not packed:
+            continue
+        code = packed[0]
+        kind = reverse_map.get(code)
+        if kind is None:
+            continue
+        match_time = packed[1] if len(packed) > 1 else None
+        added = packed[2] if len(packed) > 2 else None
+        side = packed[3] if len(packed) > 3 else ''
+        update_time = packed[4] if len(packed) > 4 else ''
+        item = {'type': kind, 'updateType': kind}
+        if match_time not in [None, '']:
+            item['matchTime'] = match_time
+            item['elapsedRegularTime'] = match_time
+        if added not in [None, '']:
+            item['elapsedAddedTime'] = added
+        if side:
+            item['team'] = side
+            if side == 'home':
+                item['teamName'] = home_name
+            elif side == 'away':
+                item['teamName'] = away_name
+        if update_time:
+            item['updateTime'] = update_time
+        details.append(item)
+    return {
+        'eventId': record.get('id', ''),
+        'inPlayMatchStatus': timeline.get('ph', ''),
+        'elapsedRegularTime': timeline.get('el'),
+        'score': {
+            'home': {'name': home_name, 'score': score_values[0], 'halfTimeScore': score_values[2], 'fullTimeScore': score_values[4]},
+            'away': {'name': away_name, 'score': score_values[1], 'halfTimeScore': score_values[3], 'fullTimeScore': score_values[5]}
+        },
+        'updateDetails': details
+    }
+
+
+def _compactEvidencePoint(item):
+    if not isinstance(item, dict):
+        return None
+    selected = item.get('selected')
+    if selected is None:
+        history = item.get('history', []) or []
+        selected = history[-1] if history else None
+    result = {
+        'm': item.get('method', 'MISS'),
+        's': _compactSnapshotForState(selected)
+    }
+    if item.get('inferred'):
+        result['i'] = copy.deepcopy(item.get('inferred'))
+    return result
+
+
+def _compactPriceState(market_id):
+    clean = list(CLEAN_PRICE_HISTORY.get(market_id, []) or [])
+    result = {}
+    if clean:
+        result['c'] = _compactSnapshotForState(clean[-1])
+    return result
+
+
+def matchRecordFromTeam(team, archive_reason=None):
+    event_id = getEventID(team)
+    market_id = getMarketID(team)
+    output = canonicalOutput(team.get('output', {}))
+    home, away = getHomeAway(team)
+    runners = []
+    for runner in orderedCatalogueRunners(team):
+        runners.append([runner.get('selectionId'), runner.get('runnerName', ''), runner.get('sortPriority')])
+    timeline = LATEST_TIMELINES.get(event_id) or {
+        'eventId': event_id,
+        'score': team.get('score', {}),
+        'updateDetails': team.get('updateDetails', [])
+    }
+    evidence = CAPTURE_EVIDENCE.get(market_id, {}) or {}
+    flags = []
+    if market_id in KO_MISSING:
+        flags.append('K0')
+    if not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X']):
+        flags.append('H0')
+    if output.get('HT_Home', '') in ['', '-1'] or output.get('HT_Away', '') in ['', '-1']:
+        flags.append('S0')
+    if event_id in CATALOGUE_MISSING:
+        flags.append('CM')
+    if event_id in TIMELINE_MISSING:
+        flags.append('TM')
+
+    record = {
+        'v': LIVE_STATE_SCHEMA,
+        'id': event_id,
+        'mid': market_id,
+        'sid': runners,
+        'dt': output.get('Date') or team.get('event', {}).get('openDate', ''),
+        'cp': output.get('Competition') or team.get('competition', {}).get('name', ''),
+        'h': output.get('Home') or home,
+        'a': output.get('Away') or away,
+        'o': output,
+        'tl': _compactTimelineForState(timeline),
+        'tr': {
+            'k': [FIRST_HALF_START_TIMES.get(event_id), FIRST_HALF_START_SOURCE.get(event_id)],
+            'f': [FIRST_HALF_END_TIMES.get(event_id), FIRST_HALF_END_SCORES.get(event_id)],
+            's': [SECOND_HALF_START_TIMES.get(event_id), SECOND_HALF_START_SOURCE.get(event_id)]
+        },
+        'od': {
+            'ko': _compactEvidencePoint(evidence.get('KO')),
+            'ht': _compactEvidencePoint(evidence.get('HT'))
+        },
+        'px': _compactPriceState(market_id),
+        'fl': flags,
+        'rt': {
+            'ko': copy.deepcopy(KO_CAPTURE_STATE.get(market_id, {})),
+            'hr': _compactSnapshotForState(HT_RECESS_STATE.get(event_id)),
+            'hla': HT_REPLENISH_LAST_ATTEMPT.get(event_id),
+            'fr': copy.deepcopy(FINAL_RECOVERY_STATE.get(event_id))
+        }
+    }
+    if archive_reason:
+        record['ar'] = archive_reason
+    return record
+
+
+def teamFromMatchRecord(record):
+    if not isinstance(record, dict):
+        return None
+    home = record.get('h', '')
+    away = record.get('a', '')
+    dt = record.get('dt', '')
+    runners = []
+    for index, packed in enumerate(record.get('sid', []) or []):
+        if not isinstance(packed, list) or not packed:
+            continue
+        selection_id = packed[0]
+        runner_name = packed[1] if len(packed) > 1 else ''
+        sort_priority = packed[2] if len(packed) > 2 else index + 1
+        runners.append({'selectionId': selection_id, 'runnerName': runner_name, 'sortPriority': sort_priority})
+    if not runners and home and away:
+        runners = [
+            {'selectionId': None, 'runnerName': home, 'sortPriority': 1},
+            {'selectionId': None, 'runnerName': away, 'sortPriority': 2},
+            {'selectionId': None, 'runnerName': 'The Draw', 'sortPriority': 3}
+        ]
+    timeline = _expandTimelineFromState(record)
+    team = {
+        'marketId': record.get('mid', ''),
+        'marketName': 'Match Odds',
+        'event': {'id': record.get('id', ''), 'openDate': dt, 'name': f"{home} v {away}"},
+        'competition': {'name': record.get('cp', '')},
+        'description': {'marketTime': dt, 'marketType': 'MATCH_ODDS'},
+        'runners': runners,
+        'score': timeline.get('score', {}),
+        'updateDetails': timeline.get('updateDetails', []),
+        'output': canonicalOutput(record.get('o', {}))
+    }
+    team['output']['Date'] = team['output'].get('Date') or dt
+    team['output']['Competition'] = team['output'].get('Competition') or record.get('cp', '')
+    team['output']['Home'] = team['output'].get('Home') or home
+    team['output']['Away'] = team['output'].get('Away') or away
+    return team
+
+
+def _restoreMatchRecord(record):
+    team = teamFromMatchRecord(record)
+    if team is None:
+        return None
+    event_id = getEventID(team)
+    market_id = getMarketID(team)
+    timeline = _expandTimelineFromState(record)
+    LATEST_TIMELINES[event_id] = timeline
+
+    transitions = record.get('tr', {}) or {}
+    k = transitions.get('k') or [None, None]
+    f = transitions.get('f') or [None, None]
+    sh = transitions.get('s') or [None, None]
+    if len(k) > 0 and k[0] is not None:
+        FIRST_HALF_START_TIMES[event_id] = k[0]
+        if len(k) > 1 and k[1]:
+            FIRST_HALF_START_SOURCE[event_id] = k[1]
+    if len(f) > 0 and f[0] is not None:
+        FIRST_HALF_END_TIMES[event_id] = f[0]
+        if len(f) > 1 and f[1] is not None:
+            FIRST_HALF_END_SCORES[event_id] = f[1]
+    if len(sh) > 0 and sh[0] is not None:
+        SECOND_HALF_START_TIMES[event_id] = sh[0]
+        if len(sh) > 1 and sh[1]:
+            SECOND_HALF_START_SOURCE[event_id] = sh[1]
+
+    evidence = {}
+    for point, key in [('KO', 'ko'), ('HT', 'ht')]:
+        packed = (record.get('od', {}) or {}).get(key)
+        if not isinstance(packed, dict):
+            continue
+        selected = _expandSnapshotFromState(packed.get('s'), event_id, market_id)
+        item = {'method': packed.get('m', 'MISS'), 'selected': selected, 'history': [selected] if selected else []}
+        if packed.get('i'):
+            item['inferred'] = copy.deepcopy(packed.get('i'))
+        evidence[point] = item
+    if evidence:
+        CAPTURE_EVIDENCE[market_id] = evidence
+
+    price_items = []
+    clean_items = []
+    px = record.get('px', {}) or {}
+    for key in ['r', 'c']:
+        expanded = _expandSnapshotFromState(px.get(key), event_id, market_id)
+        if expanded:
+            price_items.append(expanded)
+            if key == 'c':
+                clean_items.append(expanded)
+    for point in evidence.values():
+        selected = point.get('selected')
+        if selected:
+            price_items.append(selected)
+            if collection.book_is_plausible(selected.get('back', [])):
+                clean_items.append(selected)
+    if price_items:
+        unique = {item.get('time', index): item for index, item in enumerate(price_items)}
+        PRICE_HISTORY[market_id] = [unique[key] for key in sorted(unique, key=lambda x: str(x))][-4:]
+    if clean_items:
+        unique = {item.get('time', index): item for index, item in enumerate(clean_items)}
+        CLEAN_PRICE_HISTORY[market_id] = [unique[key] for key in sorted(unique, key=lambda x: str(x))][-4:]
+
+    flags = set(record.get('fl', []) or [])
+    if 'K0' in flags:
+        KO_MISSING.add(market_id)
+    if 'CM' in flags:
+        CATALOGUE_MISSING.add(event_id)
+    if 'TM' in flags:
+        TIMELINE_MISSING.add(event_id)
+    runtime = record.get('rt', {}) or {}
+    if isinstance(runtime.get('ko'), dict) and runtime.get('ko'):
+        KO_CAPTURE_STATE[market_id] = copy.deepcopy(runtime.get('ko'))
+    restored_recess = _expandSnapshotFromState(runtime.get('hr'), event_id, market_id)
+    if restored_recess is not None:
+        HT_RECESS_STATE[event_id] = restored_recess
+    if runtime.get('hla') is not None:
+        HT_REPLENISH_LAST_ATTEMPT[event_id] = runtime.get('hla')
+    if isinstance(runtime.get('fr'), dict) and runtime.get('fr'):
+        FINAL_RECOVERY_STATE[event_id] = copy.deepcopy(runtime.get('fr'))
+    return team
+
+
+def _liveStatePayload():
+    records = {}
+    for team in DA_TEAMS:
+        event_id = getEventID(team)
+        if not event_id:
+            raise RuntimeError('Active match has no event id; refusing unsafe live-state save')
+        if event_id in records:
+            raise RuntimeError(f'Duplicate active event id {event_id}; refusing unsafe live-state save')
+        records[event_id] = matchRecordFromTeam(team)
+    return {'v': LIVE_STATE_SCHEMA, 'matches': records}
+
+
+def saveLiveState(force=False):
+    global STATE_DIRTY, LAST_SAVED_STATE_HASH, LIVE_STATE_RESTORED_FROM_BACKUP
     if not force and not STATE_DIRTY:
-        return
-    filename = f"{currentUKDay()}_checkpoint.json"
-    lib.saveToJSONWithBackup(_checkpointState(), filename)
+        return False
+    payload = _liveStatePayload()
+    current_hash = state_store.state_hash(payload)
+    if (LAST_SAVED_STATE_HASH == current_hash and os.path.isfile(LIVE_STATE_FILE)
+            and not LIVE_STATE_RESTORED_FROM_BACKUP):
+        STATE_DIRTY = False
+        return False
+
+    # If the main file was unreadable and state came from .bak, do not rotate the
+    # unreadable main file over the good backup. Rebuild live_state.json in place
+    # and keep the known-good .bak until the next normal state change.
+    keep_backup = not LIVE_STATE_RESTORED_FROM_BACKUP
+    LAST_SAVED_STATE_HASH = state_store.atomic_write_json(
+        payload, LIVE_STATE_FILE, backup=keep_backup
+    )
+    LIVE_STATE_RESTORED_FROM_BACKUP = False
     STATE_DIRTY = False
-
-
-def saveRunDump():
-    if DA_TEAMS:
-        lib.saveToJSON(DA_TEAMS, f"{currentUKDay()}_run_dump.json")
+    return True
 
 
 def persistState(force=False):
-    saveRunDump()
-    saveCheckpoint(force=force)
+    return saveLiveState(force=force)
 
 
 def _restoreDict(target, data):
@@ -1183,6 +1679,8 @@ def _restoreDict(target, data):
 def restoreCheckpoint(data):
     global DA_TEAMS
     DA_TEAMS = data.get('DA_TEAMS', []) if isinstance(data.get('DA_TEAMS', []), list) else []
+    for team in DA_TEAMS:
+        normaliseTeamOutput(team)
     _restoreDict(PRICE_HISTORY, data.get('PRICE_HISTORY', {}))
     _restoreDict(CLEAN_PRICE_HISTORY, data.get('CLEAN_PRICE_HISTORY', {}))
     if not CLEAN_PRICE_HISTORY:
@@ -1206,7 +1704,6 @@ def restoreCheckpoint(data):
     _restoreDict(HT_UNAVAILABLE_COUNTS, data.get('HT_UNAVAILABLE_COUNTS', {}))
     _restoreDict(HT_LAST_UNAVAILABLE_TIMES, data.get('HT_LAST_UNAVAILABLE_TIMES', {}))
     _restoreDict(KO_CAPTURE_STATE, data.get('KO_CAPTURE_STATE', {}))
-
     KO_MISSING.clear(); KO_MISSING.update(data.get('KO_MISSING', []))
     CATALOGUE_MISSING.clear(); CATALOGUE_MISSING.update(data.get('CATALOGUE_MISSING', []))
     TIMELINE_MISSING.clear(); TIMELINE_MISSING.update(data.get('TIMELINE_MISSING', []))
@@ -1214,14 +1711,25 @@ def restoreCheckpoint(data):
     FINALIZED_MARKETS.clear(); FINALIZED_MARKETS.update(data.get('FINALIZED_MARKETS', []))
 
 
-def _stateCandidates(suffix):
-    names = []
-    for day in [currentUKDay(), currentUKDay(-1)]:
-        for ending in [suffix, suffix + '.bak']:
-            filename = f"{day}_{ending}"
-            if os.path.isfile(filename):
-                names.append(filename)
-    return sorted(names, key=lambda item: os.path.getmtime(item), reverse=True)
+def _legacyStateFiles():
+    checkpoints = []
+    run_dumps = []
+    for filename in os.listdir('.'):
+        target = None
+        if filename.endswith('_checkpoint.json'):
+            target = checkpoints
+        elif filename.endswith('_run_dump.json'):
+            target = run_dumps
+        if target is None:
+            continue
+        try:
+            target.append((os.path.getmtime(filename), filename))
+        except OSError:
+            pass
+    # Checkpoints carry richer operational state and are therefore authoritative.
+    # run_dump is only a compatibility fallback when no usable checkpoint exists.
+    return ([name for _, name in sorted(checkpoints, reverse=True)] +
+            [name for _, name in sorted(run_dumps, reverse=True)])
 
 
 def repairRestoredKOState():
@@ -1233,25 +1741,24 @@ def repairRestoredKOState():
             KO_CAPTURE_STATE.setdefault(market_id, {}).update({'event_id': event_id, 'phase': 'FROZEN'})
             KO_MISSING.discard(market_id)
             continue
-
         start = FIRST_HALF_START_TIMES.get(event_id)
         source = FIRST_HALF_START_SOURCE.get(event_id, 'restored')
-
-        # A restart may happen after the boundary-reconciliation period. If the
-        # checkpoint already contains a valid pre-in-play KO snapshot, freeze it
-        # immediately rather than losing it simply because wall-clock time moved on.
+        if source in KO_SYNTHETIC_START_SOURCES and market_id in KO_MISSING:
+            KO_MISSING.discard(market_id)
+            KO_CAPTURE_STATE.setdefault(market_id, {}).update({
+                'event_id': event_id, 'start': start, 'source': source, 'phase': 'RECOVERY'
+            })
+            markStateDirty()
         if start is not None:
             boundary_result, _ = selectKOBoundary(team, start, now_epoch)
             if boundary_result is not None:
                 freezeKO(team, boundary_result)
                 continue
-
         event = LATEST_TIMELINES.get(event_id, {})
         elapsed = eventElapsedMinutes(event)
         safe_to_reopen = start is not None and now_epoch <= start + KO_BOUNDARY_RECONCILE_SECONDS
         if source in {'timeline_fallback', 'catalogue_inplay'} and (elapsed is None or elapsed > KO_LIVE_ELAPSED_MAX_MINUTES):
             safe_to_reopen = False
-
         if market_id in KO_MISSING and safe_to_reopen:
             KO_MISSING.discard(market_id)
         if market_id in KO_MISSING:
@@ -1283,27 +1790,77 @@ def repairRestoredHTState():
             markStateDirty()
 
 
-def restoreState():
+def _loadNewLiveState():
+    global DA_TEAMS, LAST_SAVED_STATE_HASH, LIVE_STATE_RESTORED_FROM_BACKUP
+    for filename in [LIVE_STATE_FILE, LIVE_STATE_FILE + '.bak']:
+        if not os.path.isfile(filename):
+            continue
+        data = state_store.read_json(filename)
+        if not isinstance(data, dict) or data.get('v') != LIVE_STATE_SCHEMA or not isinstance(data.get('matches'), dict):
+            continue
+        DA_TEAMS = []
+        for event_id, record in data['matches'].items():
+            team = _restoreMatchRecord(record)
+            if team is not None:
+                DA_TEAMS.append(team)
+        LAST_SAVED_STATE_HASH = state_store.state_hash(data)
+        LIVE_STATE_RESTORED_FROM_BACKUP = filename.endswith('.bak')
+        if state_store.state_hash(_liveStatePayload()) != LAST_SAVED_STATE_HASH:
+            markStateDirty()
+        print(f"RESTORE: {len(DA_TEAMS)} tracked match(es) from {filename}")
+        return True
+    return False
+
+
+def _archiveClosedRestoredMatches(reason='R'):
+    now_epoch = time.time()
+    groups = {}
+    for team in list(DA_TEAMS):
+        day = matchStartDay(team)
+        close_epoch = dayCloseEpoch(day) if day else None
+        if close_epoch is not None and now_epoch >= close_epoch:
+            groups.setdefault(day, []).append(team)
+    for day, teams in sorted(groups.items()):
+        saveDayDump(day, teams, archive_reason=reason)
+        purgeTeams(teams)
+        print(f"RESTORE ARCHIVE: {len(teams)} stale match(es) -> {day}_dump.json")
+
+
+def _loadLegacyActiveState():
     global DA_TEAMS
-    for filename in _stateCandidates('checkpoint.json'):
+    files = _legacyStateFiles()
+    for filename in files:
         data = lib.readFromJSON(filename)
-        if isinstance(data, dict) and isinstance(data.get('DA_TEAMS'), list):
+        if filename.endswith('_checkpoint.json') and isinstance(data, dict) and isinstance(data.get('DA_TEAMS'), list):
             restoreCheckpoint(data)
             repairRestoredKOState()
             repairRestoredHTState()
-            print(f"RESTORE: {len(DA_TEAMS)} tracked match(es) from {filename}")
-            return
-
-    for filename in _stateCandidates('run_dump.json'):
-        data = lib.readFromJSON(filename)
-        if isinstance(data, list):
+            print(f"LEGACY RESTORE: {len(DA_TEAMS)} tracked match(es) from {filename}")
+            return True
+        if filename.endswith('_run_dump.json') and isinstance(data, list):
             DA_TEAMS = data
+            for team in DA_TEAMS:
+                normaliseTeamOutput(team)
             restoreLegacyOperationalState()
             repairRestoredKOState()
             repairRestoredHTState()
             markStateDirty()
-            print(f"RESTORE: {len(DA_TEAMS)} tracked match(es) from legacy {filename}")
-            return
+            print(f"LEGACY RESTORE: {len(DA_TEAMS)} tracked match(es) from {filename}")
+            return True
+    return False
+
+
+def restoreState():
+    if _loadNewLiveState():
+        persistState(force=True)
+        return True
+    if _loadLegacyActiveState():
+        migrateLegacyDumpFiles()
+        persistState(force=True)
+        return True
+    migrateLegacyDumpFiles()
+    persistState(force=True)
+    return False
 
 
 def _resultKey(output):
@@ -1480,15 +2037,13 @@ def rememberTimelineStates(timelines, live_signals=None):
             LATEST_TIMELINES[event_id] = copy.deepcopy(event)
             markStateDirty()
 
-        if hasTransition(event, 'KickOff') and event_id not in FIRST_HALF_START_TIMES:
-            kickoff, source = observedKickoffTime(event, now_epoch)
-            if kickoff is not None:
-                FIRST_HALF_START_TIMES[event_id] = kickoff
-                FIRST_HALF_START_SOURCE[event_id] = source
-                team = findTeamByEvent(event_id)
-                if team is not None and not koIsFilled(team):
-                    ensureKOState(team, kickoff, source)
-                markStateDirty()
+        if hasTransition(event, 'KickOff'):
+            changed_boundary = reconcileTimelineKickOff(event, now_epoch)
+            kickoff = FIRST_HALF_START_TIMES.get(event_id)
+            source = FIRST_HALF_START_SOURCE.get(event_id)
+            team = findTeamByEvent(event_id)
+            if team is not None and kickoff is not None and not koIsFilled(team):
+                ensureKOState(team, kickoff, source or 'timeline')
 
         if hasTransition(event, 'FirstHalfEnd') and event_id not in FIRST_HALF_END_TIMES:
             first_end = transitionTime(event, 'FirstHalfEnd')
@@ -1587,11 +2142,6 @@ def processCatalogueKickOffFallback(current_catalogue):
         if start is not None:
             ensureKOState(team, start, source or 'catalogue_inplay')
 
-KO_SYNTHETIC_START_SOURCES = {
-    'catalogue_inplay_live', 'catalogue_inplay_late', 'late_rediscovery', 'catalogue_inplay'
-}
-
-
 def _recoverBoundarySnapshot(team, snapshot, reference):
     if snapshot is None:
         return None
@@ -1653,6 +2203,119 @@ def _koFirstPostCandidate(team, start):
                  and item.get('inplay') is True), None)
 
 
+def _storedPreKOSnapshot(team):
+    state = KO_CAPTURE_STATE.get(getMarketID(team), {}) or {}
+    snapshot = state.get('pre')
+    return copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
+
+
+def _koMaterialEventBeforePost(team, post_snapshot):
+    """Return a reason only when a material event predates the post-KO snapshot."""
+    if not isinstance(post_snapshot, dict):
+        return None
+    event_id = getEventID(team)
+    if event_id in TIMELINE_MISSING:
+        return 'TIMELINE_MISSING'
+
+    event = LATEST_TIMELINES.get(event_id, {}) or {}
+    post_time = post_snapshot.get('time') or time.time()
+    start = FIRST_HALF_START_TIMES.get(event_id)
+    untimed_material = False
+
+    for detail in event.get('updateDetails', []) or []:
+        event_type = str(detail.get('updateType') or detail.get('type') or '')
+        kind = event_type.lower().replace('_', '')
+        if kind not in {'goal', 'redcard', 'sendingoff', 'dismissal'}:
+            continue
+
+        event_time = parseBetfairTimestamp(detail.get('updateTime'))
+        if event_time is not None and event_time <= 86400:
+            event_time = None
+        if event_time is None and start is not None:
+            try:
+                elapsed = detail.get('elapsedRegularTime')
+                if elapsed in [None, '']:
+                    elapsed = detail.get('matchTime')
+                if elapsed not in [None, '']:
+                    event_time = start + float(elapsed) * 60
+            except Exception:
+                event_time = None
+
+        if event_time is None:
+            untimed_material = True
+            continue
+        if event_time <= post_time:
+            return event_type.upper() or 'MATERIAL_EVENT'
+
+    # Only use the current score as a conservative fallback when material event
+    # timing itself is unavailable. A later goal must not invalidate a clean
+    # post-KO snapshot during restore/recovery.
+    if untimed_material:
+        score = currentScore(event)
+        if score is not None and (score[0] > 0 or score[1] > 0):
+            return f"GOAL_SCORE_{score[0]}-{score[1]}"
+    return None
+
+
+def _fmtOdds(prices):
+    labels = ['1', '2', 'X']
+    values = []
+    for label, value in zip(labels, prices or []):
+        if value is None:
+            values.append(f"{label}:NA")
+        else:
+            values.append(f"{label}:{float(value):.2f}")
+    return '|'.join(values)
+
+
+def _koTripletTickMove(first, second):
+    """Total absolute Betfair-tick movement across 1/2/X."""
+    if not isinstance(first, (list, tuple)) or not isinstance(second, (list, tuple)):
+        return None
+    if len(first) != 3 or len(second) != 3:
+        return None
+    distances = []
+    for before, after in zip(first, second):
+        if before is None or after is None or before <= 1.0 or after <= 1.0:
+            return None
+        distance = collection._tick_distance(before, after)
+        if distance >= 9999:
+            return None
+        distances.append(int(distance))
+    return sum(distances)
+
+
+def logKOBoundaryMovement(team, pre_result, post_result):
+    """Log pre/post KO only when the boundary move is unusually large.
+
+    The baseline is the sequence of valid 30-second pre-KO triplet movements
+    collected during the final three minutes. A boundary move is logged only
+    when it is clearly above both the typical and the largest recent move.
+    """
+    if pre_result is None or post_result is None:
+        return
+    pre = list(pre_result.get('back', []))
+    post = list(post_result.get('back', []))
+    final_move = _koTripletTickMove(pre, post)
+    if final_move is None:
+        return
+
+    state = KO_CAPTURE_STATE.get(getMarketID(team), {}) or {}
+    recent = [int(value) for value in (state.get('pm') or [])
+              if isinstance(value, (int, float)) and value >= 0]
+    if len(recent) < 2:
+        return
+
+    expected = statistics.median(recent)
+    recent_peak = max(recent)
+    threshold = max(4, math.ceil(expected * 2.5), recent_peak + 2)
+    if final_move < threshold:
+        return
+
+    logIssue(team, 'ko_boundary_move', 'KO_MOVE',
+             f"pre={_fmtOdds(pre)};post={_fmtOdds(post)}")
+
+
 def selectKOBoundary(team, start, now_epoch=None):
     now_epoch = now_epoch or time.time()
     event_id = getEventID(team)
@@ -1661,37 +2324,58 @@ def selectKOBoundary(team, start, now_epoch=None):
     clean_reference = [item for item in CLEAN_PRICE_HISTORY.get(market_id, [])
                        if (item.get('time', 0) or 0) <= start]
 
+    # The explicit saved pre-KO snapshot is authoritative as the fallback. It is
+    # collected only on the ordinary 30-second cycle during the final 3 minutes.
     pre_result = None
-    for item in _koPreCandidates(team, start, source):
-        recovered = _recoverBoundarySnapshot(team, item, clean_reference)
-        if recovered is not None:
-            pre_result = recovered
-            if snapshotIsKosher(recovered['selected'], clean_reference):
-                clean_reference.append(recovered['selected'])
+    stored_pre = _storedPreKOSnapshot(team)
+    if stored_pre is not None:
+        pre_result = _recoverBoundarySnapshot(team, stored_pre, clean_reference)
+
+    # Compatibility with state created before the explicit pre-KO slot existed.
+    if pre_result is None:
+        for item in _koPreCandidates(team, start, source):
+            recovered = _recoverBoundarySnapshot(team, item, clean_reference)
+            if recovered is not None:
+                pre_result = recovered
+                if snapshotIsKosher(recovered['selected'], clean_reference):
+                    clean_reference.append(recovered['selected'])
 
     post_raw = _koFirstPostCandidate(team, start)
     post_result = _recoverBoundarySnapshot(team, post_raw, clean_reference) if post_raw is not None else None
 
+    # Catalogue/scheduled-time fallbacks do not define the real KO boundary.
+    # Keep collecting 30-second evidence and timeline updates until a genuine
+    # KickOff observation replaces the synthetic start.
+    if source in KO_SYNTHETIC_START_SOURCES:
+        return None, False
+
     if pre_result is not None and post_result is not None:
-        if collection.boundary_snapshots_close(pre_result['selected'], post_result['selected']):
-            post_result['method'] = 'BOUNDARY_POST'
-            return post_result, True
-        pre_result['method'] = 'BOUNDARY_PRE'
-        return pre_result, True
+        event_reason = _koMaterialEventBeforePost(team, post_result.get('selected'))
+        if event_reason:
+            pre_result['method'] = 'BOUNDARY_PRE_EVENT'
+            return pre_result, True
+
+        # Normal case: use the first clean post-KO price even if it moved from
+        # the pre-KO market. Only unusually large boundary moves are logged.
+        logKOBoundaryMovement(team, pre_result, post_result)
+        post_result['method'] = 'BOUNDARY_POST'
+        return post_result, True
 
     if post_result is not None:
         # A post-kick-off price can stand alone only when the kick-off boundary
-        # came from a real timeline observation rather than a late/synthetic rediscovery.
+        # came from a real timeline observation and the same cycle has no sign
+        # that a goal/red card already contaminated that first post-KO price.
         if source not in KO_SYNTHETIC_START_SOURCES:
-            post_result['method'] = 'BOUNDARY_POST_ONLY'
-            return post_result, True
+            event_reason = _koMaterialEventBeforePost(team, post_result.get('selected'))
+            if event_reason is None:
+                post_result['method'] = 'BOUNDARY_POST_ONLY'
+                return post_result, True
 
     if pre_result is not None and now_epoch >= start + KO_POST_BOUNDARY_SECONDS:
         pre_result['method'] = 'BOUNDARY_PRE'
         return pre_result, True
 
     return None, now_epoch > start + KO_BOUNDARY_RECONCILE_SECONDS
-
 
 def firstKosherKO(team, start):
     result, ready = selectKOBoundary(team, start)
@@ -1719,9 +2403,17 @@ def applyPendingKO(timelines, results):
 
         if ready:
             state = KO_CAPTURE_STATE.setdefault(market_id, {})
+            source = FIRST_HALF_START_SOURCE.get(event_id, state.get('source', 'unknown'))
+            if source in KO_SYNTHETIC_START_SOURCES:
+                state.update({'event_id': event_id, 'start': start, 'source': source,
+                              'phase': 'RECOVERY',
+                              'deadline': start + KO_BOUNDARY_RECONCILE_SECONDS})
+                KO_MISSING.discard(market_id)
+                markStateDirty()
+                continue
             state.update({'event_id': event_id, 'start': start,
-                          'source': FIRST_HALF_START_SOURCE.get(event_id, state.get('source', 'unknown')),
-                          'phase': 'MISSING', 'deadline': start + KO_BOUNDARY_RECONCILE_SECONDS})
+                          'source': source, 'phase': 'MISSING',
+                          'deadline': start + KO_BOUNDARY_RECONCILE_SECONDS})
             rememberCaptureEvidence(team, 'KO', {'method': 'MISS', 'raw': None})
             KO_MISSING.add(market_id)
             logIssue(team, 'late_start', 'KO', f"{state.get('source', 'unknown')}|obs={collectorStamp()}")
@@ -1933,7 +2625,7 @@ def processSecondHalfStarts(timelines, live_signals=None):
         market_id = getMarketID(team)
         attempted.add(market_id)
 
-        # Existing boundaries are retried by the 5-second replenish cycle.
+        # Existing boundaries are retried at the next 10-second scheduler opportunity.
         if existing is not None:
             continue
 
@@ -2025,7 +2717,14 @@ def freezeHT(team, result, event_details):
 
 
 def koIsFilled(team):
-    return getMarketID(team) in KO_MISSING or any(team['output'].get(key, 0) for key in ['KO_1', 'KO_2', 'KO_X'])
+    if any(team['output'].get(key, 0) for key in ['KO_1', 'KO_2', 'KO_X']):
+        return True
+    market_id = getMarketID(team)
+    if market_id not in KO_MISSING:
+        return False
+    event_id = getEventID(team)
+    source = FIRST_HALF_START_SOURCE.get(event_id) or (KO_CAPTURE_STATE.get(market_id, {}) or {}).get('source')
+    return source not in KO_SYNTHETIC_START_SOURCES
 
 
 def htIsFilled(team):
@@ -2047,9 +2746,10 @@ def preKOFocusEntries():
 
         event_id = getEventID(entry)
         actual_start = FIRST_HALF_START_TIMES.get(event_id)
-        if actual_start is None:
-            # Keep polling around a delayed kick-off until we actually observe
-            # the start, rather than stopping just after the scheduled time.
+        start_source = FIRST_HALF_START_SOURCE.get(event_id)
+        if actual_start is None or not koStartSourceReliable(start_source):
+            # A scheduled/catalogue fallback is not the real KO boundary. Keep
+            # timeline watching through delayed starts until reliable evidence arrives.
             in_window = market_time - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60)
         else:
             in_window = now_epoch <= actual_start + KO_BOUNDARY_RECONCILE_SECONDS
@@ -2063,9 +2763,147 @@ def preKOFocusEntries():
             continue
         event_id = getEventID(team)
         start = FIRST_HALF_START_TIMES.get(event_id)
-        if start is not None and start - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= start + KO_BOUNDARY_RECONCILE_SECONDS:
-            entries[getMarketID(team)] = team
+        source = FIRST_HALF_START_SOURCE.get(event_id)
+        if start is not None and koStartSourceReliable(source):
+            if start - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= start + KO_BOUNDARY_RECONCILE_SECONDS:
+                entries[getMarketID(team)] = team
+        elif not koStartSourceReliable(source):
+            market_time = scheduledStart(team)
+            if market_time is not None and market_time - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60):
+                entries[getMarketID(team)] = team
     return list(entries.values())
+
+def koStandardPriceEntries():
+    """KO price work for the ordinary 30-second cycle only.
+
+    Start three minutes before scheduled KO, retain the latest complete/plausible
+    pre-KO book and make one first post-KO observation on the first standard
+    cycle after the real start has been detected.
+    """
+    now_epoch = time.time()
+    entries = {}
+
+    for entry in NEAR_START_CATALOGUE.values():
+        if entryAlreadyFinalized(entry):
+            continue
+        market_time = scheduledStart(entry)
+        if market_time is None:
+            continue
+        event_id = getEventID(entry)
+        team = findTeamByEvent(event_id)
+        actual_start = FIRST_HALF_START_TIMES.get(event_id)
+        start_source = FIRST_HALF_START_SOURCE.get(event_id)
+
+        if actual_start is None or not koStartSourceReliable(start_source):
+            in_window = (market_time - (KO_FOCUS_BEFORE_MINUTES * 60)
+                         <= now_epoch
+                         <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60))
+        else:
+            in_window = now_epoch <= actual_start + KO_POST_BOUNDARY_SECONDS
+
+        if not in_window:
+            continue
+        if team is None:
+            team = initialiseTeam(entry, LATEST_TIMELINES.get(event_id, {}))
+        if team is not None and not koIsFilled(team):
+            entries[getMarketID(team)] = team
+
+    # A pre-KO team is deliberately created during the final three minutes so
+    # its latest valid snapshot survives a process restart in live_state.json.
+    for team in DA_TEAMS:
+        if koIsFilled(team):
+            continue
+        event_id = getEventID(team)
+        actual_start = FIRST_HALF_START_TIMES.get(event_id)
+        start_source = FIRST_HALF_START_SOURCE.get(event_id)
+        if actual_start is not None and koStartSourceReliable(start_source):
+            if now_epoch <= actual_start + KO_POST_BOUNDARY_SECONDS:
+                entries[getMarketID(team)] = team
+            continue
+        market_time = scheduledStart(team)
+        if market_time is not None and (market_time - (KO_FOCUS_BEFORE_MINUTES * 60)
+                                        <= now_epoch
+                                        <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60)):
+            entries[getMarketID(team)] = team
+
+    return list(entries.values())
+
+
+def htRecessPriceEntries():
+    """Half-time recess prices sampled only on the ordinary 30-second cycle."""
+    entries = []
+    for team in htFocusEntries():
+        if getEventID(team) in SECOND_HALF_START_TIMES:
+            continue
+        entries.append(team)
+    return entries
+
+
+def rememberLatestPreKO(entries, results):
+    now_epoch = time.time()
+    for entry in entries:
+        market_id = getMarketID(entry)
+        result = results.get(market_id) or {}
+        # LAST is an older fallback, not a new 30-second observation.
+        if result.get('method') in {'LAST', 'MISS'}:
+            continue
+        snapshot = result.get('current_raw')
+        if snapshot is None or snapshot.get('inplay') is True:
+            continue
+        if not collection.book_is_plausible(snapshot.get('back', [])):
+            continue
+
+        team = findTeamByEvent(getEventID(entry)) or entry
+        event_id = getEventID(team)
+        start = FIRST_HALF_START_TIMES.get(event_id)
+        start_source = FIRST_HALF_START_SOURCE.get(event_id)
+        # Only a genuine timeline KO boundary can close the pre-KO slot. A
+        # scheduled/catalogue fallback must not discard valid delayed pre-KO books.
+        if start is not None and koStartSourceReliable(start_source) and (snapshot.get('time', now_epoch) or now_epoch) >= start:
+            continue
+
+        state = KO_CAPTURE_STATE.setdefault(market_id, {})
+        state['event_id'] = getEventID(team)
+
+        # Keep only tiny movement statistics, not every pre-KO snapshot. Each
+        # value is the total 1/2/X Betfair-tick movement from one valid 30-second
+        # observation to the next during the final three minutes.
+        previous = state.get('pre')
+        previous_time = (previous or {}).get('time') if isinstance(previous, dict) else None
+        current_time = snapshot.get('time', now_epoch)
+        if isinstance(previous, dict) and previous_time != current_time:
+            movement = _koTripletTickMove(previous.get('back', []), snapshot.get('back', []))
+            if movement is not None:
+                moves = list(state.get('pm') or [])
+                moves.append(int(movement))
+                state['pm'] = moves[-6:]
+
+        state['pre'] = compactHistorySnapshot(snapshot)
+        state['pre_observed_at'] = current_time
+        if state.get('phase') not in {'FROZEN', 'MISSING'}:
+            state['phase'] = 'PREWATCH'
+        markStateDirty()
+
+
+def rememberLatestHTRecess(entries, results):
+    for team in entries:
+        event_id = getEventID(team)
+        if event_id in SECOND_HALF_START_TIMES:
+            continue
+        result = results.get(getMarketID(team)) or {}
+        if result.get('method') in {'LAST', 'MISS'}:
+            continue
+        snapshot = result.get('current_raw')
+        if snapshot is None or not collection.book_is_plausible(snapshot.get('back', [])):
+            continue
+        # Store only a confirmed/reconstructed recess, not the broad 55-minute
+        # fallback watch used when FirstHalfEnd itself is missing.
+        event = LATEST_TIMELINES.get(event_id, {}) or {}
+        if event_id not in FIRST_HALF_END_TIMES and event.get('inPlayMatchStatus') != 'FirstHalfEnd':
+            continue
+        HT_RECESS_STATE[event_id] = compactHistorySnapshot(snapshot)
+        markStateDirty()
+
 
 def htFocusEntries():
     now_epoch = time.time()
@@ -2184,7 +3022,8 @@ def applyPendingHT(timelines, results=None):
 
 
 def eventFinished(event):
-    if event.get('inPlayMatchStatus') == 'Finished' or hasTransition(event, 'Finished'):
+    if (event.get('inPlayMatchStatus') == 'Finished' or hasTransition(event, 'Finished') or
+            hasTransition(event, 'SecondHalfEnd')):
         return True
     score = event.get('score', {})
     return score.get('home', {}).get('fullTimeScore') not in [None, ''] and score.get('away', {}).get('fullTimeScore') not in [None, '']
@@ -2204,6 +3043,7 @@ def cleanupEventState(team):
     SECOND_HALF_START_TIMES.pop(event_id, None)
     SECOND_HALF_START_SOURCE.pop(event_id, None)
     HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
+    HT_RECESS_STATE.pop(event_id, None)
     LATEST_TIMELINES.pop(event_id, None)
     NEAR_START_CATALOGUE.pop(event_id, None)
     CURRENT_INPLAY_CATALOGUE.pop(event_id, None)
@@ -2215,8 +3055,10 @@ def cleanupEventState(team):
     HT_CLEAN_SEEN.discard(event_id)
     HT_UNAVAILABLE_COUNTS.pop(event_id, None)
     HT_LAST_UNAVAILABLE_TIMES.pop(event_id, None)
+    FINAL_RECOVERY_STATE.pop(event_id, None)
 
 def finaliseTeam(team, event):
+    normaliseTeamOutput(team)
     team['score'] = event.get('score', team.get('score', ''))
     team['updateDetails'] = event.get('updateDetails', team.get('updateDetails', ''))
     score = team.get('score', {})
@@ -2234,9 +3076,11 @@ def finaliseTeam(team, event):
     team['output']['P/L_ZZCX'] = getPL(team['output'], 'MULTI_ZZCX')
     roundOutputDecimals(team['output'])
 
-    date_epoch = parseBetfairTimestamp(team['output']['Date'])
-    date = betfairAPI.datetime.datetime.fromtimestamp(date_epoch, betfairAPI.datetime.timezone.utc) if date_epoch is not None else betfairAPI.datetime.datetime.now()
-    filename = f"{date.strftime('%Y%m%d')}_results.csv"
+    day = matchStartDay(team)
+    if day is None:
+        day = currentUTCDay()
+        logIssue(team, 'date_route_fallback', 'FINAL', 'missing_start_date')
+    filename = f"{day}_results.csv"
     key = _resultKey(team['output'])
     keys = resultKeys(filename)
 
@@ -2248,7 +3092,7 @@ def finaliseTeam(team, event):
 
     if saved:
         if captureNeedsForensicState(team):
-            mergeDumpStateRecords(date.strftime('%Y%m%d'), [teamStateRecord(team, 'finalized_problematic')])
+            saveProblemRecord(day, team, 'P')
         FINALIZED_MARKETS.add(getMarketID(team))
         if team in DA_TEAMS:
             DA_TEAMS.remove(team)
@@ -2363,167 +3207,247 @@ def compactEvidence(evidence):
             result[point]['inferred'] = copy.deepcopy(item.get('inferred'))
     return result
 
-def teamStateRecord(team, reason='unresolved_dump'):
-    event_id = getEventID(team)
-    market_id = getMarketID(team)
-    output = team.get('output', {})
-    home, away = getHomeAway(team)
-    timeline = LATEST_TIMELINES.get(event_id) or {
-        'score': team.get('score', {}), 'updateDetails': team.get('updateDetails', [])
-    }
-    evidence = compactEvidence(CAPTURE_EVIDENCE.get(market_id, {}))
-    ko_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['KO_1', 'KO_2', 'KO_X'])
-    ht_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X'])
-    need_context = (ko_missing and 'KO' not in evidence) or (ht_missing and 'HT' not in evidence)
-    price_context = forensicPriceContext(market_id) if need_context else []
+def _legacyTimelineToCompact(timeline):
+    if not isinstance(timeline, dict):
+        return {}
+    score = timeline.get('score', {}) or {}
+    home = score.get('home', {}) or {}
+    away = score.get('away', {}) or {}
+    code_map = {'KickOff': 'K', 'FirstHalfEnd': 'F', 'SecondHalfKickOff': 'S',
+                'Finished': 'E', 'SecondHalfEnd': 'E', 'Goal': 'G'}
+    events = []
+    for item in timeline.get('events', []) or timeline.get('updateDetails', []) or []:
+        kind = item.get('updateType') or item.get('type')
+        code = code_map.get(kind)
+        if code is None:
+            continue
+        mt = item.get('matchTime')
+        if mt in [None, '']:
+            mt = item.get('elapsedRegularTime')
+        events.append([code, mt, item.get('elapsedAddedTime'), item.get('team', ''), item.get('updateTime', '')])
     return {
-        'state_reason': reason,
-        'event_id': event_id,
-        'market_id': market_id,
-        'fixture': {
-            'Date': output.get('Date', team.get('event', {}).get('openDate', '')),
-            'Competition': output.get('Competition', team.get('competition', {}).get('name', '')),
-            'Home': output.get('Home', home),
-            'Away': output.get('Away', away)
-        },
-        'observed': {key: output.get(key) for key in
-                     ['HT_Home', 'HT_Away', 'FT_Home', 'FT_Away',
-                      'KO_1', 'KO_2', 'KO_X', 'HT_1', 'HT_2', 'HT_X']},
-        'capture_evidence': evidence,
-        'price_context': price_context,
-        'transitions': {
-            'first_half_start': FIRST_HALF_START_TIMES.get(event_id),
-            'first_half_start_source': FIRST_HALF_START_SOURCE.get(event_id),
-            'first_half_end': FIRST_HALF_END_TIMES.get(event_id),
-            'first_half_end_score': FIRST_HALF_END_SCORES.get(event_id),
-            'second_half_start': SECOND_HALF_START_TIMES.get(event_id),
-            'second_half_start_source': SECOND_HALF_START_SOURCE.get(event_id),
-            'ko_state': copy.deepcopy(KO_CAPTURE_STATE.get(market_id, {}))
-        },
-        'timeline': essentialTimeline(timeline),
-        'flags': {
-            'ko_missing': market_id in KO_MISSING,
-            'catalogue_missing': event_id in CATALOGUE_MISSING,
-            'timeline_missing': event_id in TIMELINE_MISSING
-        }
+        'ph': timeline.get('status', timeline.get('inPlayMatchStatus', '')),
+        'el': timeline.get('elapsed', timeline.get('elapsedRegularTime')),
+        'sc': [home.get('score', ''), away.get('score', ''),
+               home.get('halfTimeScore', ''), away.get('halfTimeScore', ''),
+               home.get('fullTimeScore', ''), away.get('fullTimeScore', '')],
+        'ev': events
     }
 
-def dumpStateForTeams(teams, reason='unresolved_dump'):
-    return [teamStateRecord(team, reason) for team in teams]
 
+def _legacyForensicToRecord(raw, day='', archive_reason='U'):
+    if not isinstance(raw, dict):
+        return None
+    if raw.get('v') == LIVE_STATE_SCHEMA and raw.get('id'):
+        result = copy.deepcopy(raw)
+        result['ar'] = result.get('ar') or archive_reason
+        return result
 
-def compactLegacyForensicRecord(record):
-    if not isinstance(record, dict) or 'team' not in record:
-        return record
-    team = record.get('team') or {}
-    event_id = record.get('event_id') or getEventID(team)
-    market_id = record.get('market_id') or getMarketID(team)
-    output = team.get('output', {})
-    home, away = getHomeAway(team) if team else ('', '')
-    timeline = record.get('latest_timeline') or {'score': team.get('score', {}), 'updateDetails': team.get('updateDetails', [])}
-    evidence = compactEvidence(record.get('capture_evidence', {}))
-    observed_ko_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['KO_1', 'KO_2', 'KO_X'])
-    observed_ht_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X'])
-    need_context = (observed_ko_missing and 'KO' not in evidence) or (observed_ht_missing and 'HT' not in evidence)
-    old_context = record.get('price_context', []) or record.get('price_history', [])
-    price_context = boundedHistory(old_context) if need_context else boundedHistory(record.get('price_context', []))
+    if 'team' in raw:
+        raw = compactLegacyForensicRecord(raw)
+    if 'fixture' not in raw:
+        return None
+    fixture = raw.get('fixture', {}) or {}
+    observed = raw.get('observed', {}) or {}
+    output = outputTemplate.copy()
+    output['Date'] = fixture.get('Date', '')
+    output['Competition'] = fixture.get('Competition', '')
+    output['Home'] = fixture.get('Home', '')
+    output['Away'] = fixture.get('Away', '')
+    for key, value in observed.items():
+        if key in output:
+            output[key] = value
+    transitions = raw.get('transitions', {}) or {}
+    evidence = raw.get('capture_evidence', {}) or {}
+    od = {}
+    for point, key in [('KO', 'ko'), ('HT', 'ht')]:
+        item = evidence.get(point)
+        if isinstance(item, dict):
+            od[key] = _compactEvidencePoint(item)
+        else:
+            od[key] = None
+    flags = raw.get('flags', {}) or {}
+    fl = []
+    if flags.get('ko_missing'):
+        fl.append('K0')
+    if flags.get('catalogue_missing'):
+        fl.append('CM')
+    if flags.get('timeline_missing'):
+        fl.append('TM')
+    if not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X']):
+        fl.append('H0')
+    price_context = raw.get('price_context', []) or []
+    px = {}
+    if price_context:
+        px['r'] = _compactSnapshotForState(price_context[-1])
+        clean = [item for item in price_context if collection.book_is_plausible(item.get('back', []))]
+        if clean:
+            px['c'] = _compactSnapshotForState(clean[-1])
     return {
-        'state_reason': record.get('state_reason', 'legacy'),
-        'event_id': event_id,
-        'market_id': market_id,
-        'fixture': {
-            'Date': output.get('Date', team.get('event', {}).get('openDate', '')),
-            'Competition': output.get('Competition', team.get('competition', {}).get('name', '')),
-            'Home': output.get('Home', home),
-            'Away': output.get('Away', away)
+        'v': LIVE_STATE_SCHEMA,
+        'id': collection.normalise_id(raw.get('event_id', '')),
+        'mid': collection.normalise_id(raw.get('market_id', '')),
+        'sid': [],
+        'dt': fixture.get('Date', ''),
+        'cp': fixture.get('Competition', ''),
+        'h': fixture.get('Home', ''),
+        'a': fixture.get('Away', ''),
+        'o': output,
+        'tl': _legacyTimelineToCompact(raw.get('timeline', {})),
+        'tr': {
+            'k': [transitions.get('first_half_start'), transitions.get('first_half_start_source')],
+            'f': [transitions.get('first_half_end'), transitions.get('first_half_end_score')],
+            's': [transitions.get('second_half_start'), transitions.get('second_half_start_source')]
         },
-        'observed': {key: output.get(key) for key in
-                     ['HT_Home', 'HT_Away', 'FT_Home', 'FT_Away',
-                      'KO_1', 'KO_2', 'KO_X', 'HT_1', 'HT_2', 'HT_X']},
-        'capture_evidence': evidence,
-        'price_context': price_context,
-        'transitions': {
-            'first_half_start': record.get('first_half_start_time'),
-            'first_half_start_source': record.get('first_half_start_source'),
-            'first_half_end': record.get('first_half_end_time'),
-            'first_half_end_score': record.get('first_half_end_score'),
-            'second_half_start': record.get('second_half_start_time'),
-            'second_half_start_source': record.get('second_half_start_source'),
-            'ko_state': {}
-        },
-        'timeline': essentialTimeline(timeline),
-        'flags': {
-            'ko_missing': bool(record.get('ko_missing')),
-            'catalogue_missing': bool(record.get('catalogue_missing')),
-            'timeline_missing': bool(record.get('timeline_missing'))
-        }
+        'od': od,
+        'px': px,
+        'fl': sorted(set(fl)),
+        'rt': {'ko': copy.deepcopy(transitions.get('ko_state', {})), 'hla': None},
+        'ar': archive_reason
     }
 
 
-def forensicScore(record):
-    observed = record.get('observed', {}) if isinstance(record, dict) else {}
-    score = sum(1 for key in ['KO_1', 'KO_2', 'KO_X', 'HT_1', 'HT_2', 'HT_X']
-                if float(observed.get(key, 0) or 0) > 0)
-    evidence = record.get('capture_evidence', {}) if isinstance(record, dict) else {}
-    for point in ['KO', 'HT']:
-        item = evidence.get(point, {}) if isinstance(evidence, dict) else {}
-        score += min(len(item.get('history', []) or []), FORENSIC_MAX_SNAPSHOTS)
-        if item.get('selected'):
-            score += 2
-    score += min(len(record.get('price_context', []) or []), FORENSIC_MAX_SNAPSHOTS)
+def _legacyTeamToRecord(team, archive_reason='U'):
+    if not isinstance(team, dict):
+        return None
+    if team.get('v') == LIVE_STATE_SCHEMA and team.get('id'):
+        result = copy.deepcopy(team)
+        result['ar'] = result.get('ar') or archive_reason
+        return result
+    if 'output' not in team:
+        return None
+    # Temporarily use the normal serializer. It naturally emits an empty/minimal
+    # forensic section when the old dump did not contain those global structures.
+    return matchRecordFromTeam(team, archive_reason=archive_reason)
+
+
+def _recordRichness(record):
+    if not isinstance(record, dict):
+        return -1
+    score = 0
+    output = record.get('o', {}) or {}
+    score += sum(1 for key in ['HT_Home', 'HT_Away', 'FT_Home', 'FT_Away',
+                               'KO_1', 'KO_2', 'KO_X', 'HT_1', 'HT_2', 'HT_X']
+                 if output.get(key) not in ['', None, 0, 0.0, '-1'])
+    score += len((record.get('tl', {}) or {}).get('ev', []) or [])
+    for key in ['ko', 'ht']:
+        point = (record.get('od', {}) or {}).get(key)
+        if isinstance(point, dict) and point.get('s'):
+            score += 4
+    score += len(record.get('fl', []) or [])
     return score
 
-def mergeDumpStateRecords(day, records):
-    if not records:
-        return
-    filename = f"{day}_dump_state.json"
-    existing = lib.readFromJSON(filename) if os.path.isfile(filename) else []
-    if not isinstance(existing, list):
-        existing = []
 
-    merged = {}
-    for raw_record in existing + records:
-        record = compactLegacyForensicRecord(raw_record)
-        if not isinstance(record, dict):
+def _mergeMatchRecords(base, incoming):
+    if base is None:
+        return copy.deepcopy(incoming)
+    if incoming is None:
+        return copy.deepcopy(base)
+    primary, secondary = (incoming, base) if _recordRichness(incoming) >= _recordRichness(base) else (base, incoming)
+    result = copy.deepcopy(primary)
+    for key in ['id', 'mid', 'dt', 'cp', 'h', 'a']:
+        if not result.get(key) and secondary.get(key):
+            result[key] = copy.deepcopy(secondary.get(key))
+    if not result.get('sid') and secondary.get('sid'):
+        result['sid'] = copy.deepcopy(secondary.get('sid'))
+    result.setdefault('o', {})
+    for key, value in (secondary.get('o', {}) or {}).items():
+        if result['o'].get(key) in ['', None, 0, 0.0, '-1'] and value not in ['', None, 0, 0.0, '-1']:
+            result['o'][key] = copy.deepcopy(value)
+    if len((secondary.get('tl', {}) or {}).get('ev', []) or []) > len((result.get('tl', {}) or {}).get('ev', []) or []):
+        result['tl'] = copy.deepcopy(secondary.get('tl'))
+    result.setdefault('od', {})
+    for key in ['ko', 'ht']:
+        if not result['od'].get(key) and (secondary.get('od', {}) or {}).get(key):
+            result['od'][key] = copy.deepcopy(secondary['od'][key])
+    result.setdefault('px', {})
+    for key in ['r', 'c']:
+        if not result['px'].get(key) and (secondary.get('px', {}) or {}).get(key):
+            result['px'][key] = copy.deepcopy(secondary['px'][key])
+    result['fl'] = sorted(set((result.get('fl', []) or []) + (secondary.get('fl', []) or [])))
+    result['ar'] = result.get('ar') or secondary.get('ar')
+    return result
+
+
+def _readDumpRecords(day):
+    filename = f"{day}_dump.json"
+    data = state_store.read_json(filename) if os.path.isfile(filename) else None
+    records = {}
+    if isinstance(data, dict) and data.get('v') == LIVE_STATE_SCHEMA and isinstance(data.get('matches'), dict):
+        records = copy.deepcopy(data['matches'])
+        for record in records.values():
+            normaliseMatchRecordOutput(record)
+        return records
+    if isinstance(data, list):
+        for raw in data:
+            record = _legacyTeamToRecord(raw, 'U')
+            if record is None:
+                record = _legacyForensicToRecord(raw, day, 'U')
+            if record is None:
+                continue
+            key = record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
+            records[key] = _mergeMatchRecords(records.get(key), record)
+    return records
+
+
+def _writeDumpRecords(day, records):
+    for record in records.values():
+        normaliseMatchRecordOutput(record)
+    payload = {'v': LIVE_STATE_SCHEMA, 'day': day, 'matches': records}
+    filename = f"{day}_dump.json"
+    old = state_store.read_json(filename) if os.path.isfile(filename) else None
+    if isinstance(old, dict) and old.get('v') == LIVE_STATE_SCHEMA and state_store.state_hash(old) == state_store.state_hash(payload):
+        return False
+    state_store.atomic_write_json(payload, filename, backup=True)
+    return True
+
+
+def saveDayDump(day, teams, archive_reason='U'):
+    if not teams:
+        return
+    records = _readDumpRecords(day)
+    for team in teams:
+        record = matchRecordFromTeam(team, archive_reason=archive_reason)
+        key = record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
+        records[key] = _mergeMatchRecords(records.get(key), record)
+    _writeDumpRecords(day, records)
+
+
+def saveProblemRecord(day, team, archive_reason='P'):
+    saveDayDump(day, [team], archive_reason=archive_reason)
+
+
+def migrateLegacyDumpFiles():
+    days = set()
+    for filename in os.listdir('.'):
+        if len(filename) >= 18 and filename[:8].isdigit() and (filename.endswith('_dump.json') or filename.endswith('_dump_state.json')):
+            days.add(filename[:8])
+    for day in sorted(days):
+        dump_name = f"{day}_dump.json"
+        current = state_store.read_json(dump_name) if os.path.isfile(dump_name) else None
+        if isinstance(current, dict) and current.get('v') == LIVE_STATE_SCHEMA and isinstance(current.get('matches'), dict):
             continue
-        key = (record.get('event_id', ''), record.get('market_id', ''))
-        previous = merged.get(key)
-        if previous is None or forensicScore(record) >= forensicScore(previous):
-            merged[key] = record
-    lib.saveToJSON(list(merged.values()), filename)
+        records = _readDumpRecords(day)
+        state_name = f"{day}_dump_state.json"
+        legacy_state = lib.readFromJSON(state_name) if os.path.isfile(state_name) else []
+        if isinstance(legacy_state, list):
+            for raw in legacy_state:
+                reason = 'P' if str(raw.get('state_reason', '')).lower() == 'finalized_problematic' else 'U'
+                record = _legacyForensicToRecord(raw, day, reason)
+                if record is None:
+                    continue
+                key = record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
+                records[key] = _mergeMatchRecords(records.get(key), record)
+        if records:
+            _writeDumpRecords(day, records)
+            print(f"MIGRATE: {day} dump -> schema v{LIVE_STATE_SCHEMA} ({len(records)} match(es))")
 
-
-def compactDumpStateFile(day):
-    filename = f"{day}_dump_state.json"
-    if not os.path.isfile(filename):
-        return
-    existing = lib.readFromJSON(filename)
-    if not isinstance(existing, list):
-        return
-    merged = {}
-    changed = False
-    for raw_record in existing:
-        record = compactLegacyForensicRecord(raw_record)
-        if record is not raw_record or 'team' in raw_record or 'price_history' in raw_record:
-            changed = True
-        if not isinstance(record, dict):
-            continue
-        key = (record.get('event_id', ''), record.get('market_id', ''))
-        previous = merged.get(key)
-        if previous is not None:
-            changed = True
-        if previous is None or forensicScore(record) >= forensicScore(previous):
-            merged[key] = record
-    if changed:
-        lib.saveToJSON(list(merged.values()), filename)
-        print(f"Compacted forensic state: {filename} ({len(existing)} -> {len(merged)} records)")
 
 def captureNeedsForensicState(team):
     output = team.get('output', {})
     ko_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['KO_1', 'KO_2', 'KO_X'])
     ht_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X'])
     score_missing = output.get('HT_Home', '') in ['', '-1'] or output.get('HT_Away', '') in ['', '-1']
-
     evidence = CAPTURE_EVIDENCE.get(getMarketID(team), {})
     suspect_methods = {'MIX', 'INF', 'MISS'}
     ko_method = evidence.get('KO', {}).get('method')
@@ -2533,26 +3457,158 @@ def captureNeedsForensicState(team):
     fallback_ht = SECOND_HALF_START_SOURCE.get(getEventID(team), '') == 'ELAPSED_FALLBACK'
     return ko_missing or ht_missing or score_missing or reconstructed or fallback_ht
 
+
+def finaliseRestoredMatchesFromState():
+    # A restored state may already contain a definitive end-of-match signal.
+    # Finalise these rows before any fresh network call or day-close decision.
+    for team in list(DA_TEAMS):
+        event_id = getEventID(team)
+        event = LATEST_TIMELINES.get(event_id)
+        if event is None:
+            event = {
+                'eventId': event_id,
+                'score': team.get('score', {}),
+                'updateDetails': team.get('updateDetails', [])
+            }
+        if eventFinished(event):
+            finaliseTeam(team, event)
+
+
+def finalRecoveryNeeded(team, now_epoch=None):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    day = matchStartDay(team)
+    close_epoch = dayCloseEpoch(day) if day else None
+    if close_epoch is not None and now_epoch >= close_epoch:
+        return True, 'CLOSED_DAY'
+
+    start = scheduledStart(team)
+    if start is None:
+        start = parseBetfairTimestamp(team.get('output', {}).get('Date'))
+    if start is not None and now_epoch >= start + FINAL_RECOVERY_AFTER_START_SECONDS:
+        return True, 'ELAPSED'
+    return False, ''
+
+
+def scheduleFinalRecoveryJobs(now_epoch=None, restored=False):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    changed = False
+    for team in DA_TEAMS:
+        event_id = getEventID(team)
+        if not event_id or event_id in FINAL_RECOVERY_STATE:
+            continue
+        needed, reason = finalRecoveryNeeded(team, now_epoch)
+        if not needed:
+            continue
+        state = {'a': 0, 'r': reason}
+        day = matchStartDay(team)
+        close_epoch = dayCloseEpoch(day) if day else None
+        if close_epoch is not None and now_epoch >= close_epoch:
+            state['ar'] = 'R' if restored else 'U'
+        FINAL_RECOVERY_STATE[event_id] = state
+        changed = True
+    if changed:
+        markStateDirty()
+
+
+def finalRecoveryEntries():
+    result = []
+    for team in DA_TEAMS:
+        event_id = getEventID(team)
+        state = FINAL_RECOVERY_STATE.get(event_id)
+        if not isinstance(state, dict):
+            continue
+        if int(state.get('a', 0) or 0) < FINAL_RECOVERY_MAX_ATTEMPTS:
+            result.append(team)
+    return result
+
+
+def recordFinalRecoveryAttempts(requested_event_ids):
+    if ENDPOINT_LAST_ERROR.get('timeline') is not None:
+        return
+    changed = False
+    for event_id in {collection.normalise_id(item) for item in requested_event_ids if item}:
+        state = FINAL_RECOVERY_STATE.get(event_id)
+        if not isinstance(state, dict) or findTeamByEvent(event_id) is None:
+            continue
+        attempts = int(state.get('a', 0) or 0)
+        if attempts >= FINAL_RECOVERY_MAX_ATTEMPTS:
+            continue
+        state['a'] = attempts + 1
+        changed = True
+    if changed:
+        markStateDirty()
+
+
+def archiveExhaustedClosedRecoveries(now_epoch=None):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    groups = {}
+    for team in list(DA_TEAMS):
+        event_id = getEventID(team)
+        state = FINAL_RECOVERY_STATE.get(event_id)
+        if not isinstance(state, dict):
+            continue
+        if int(state.get('a', 0) or 0) < FINAL_RECOVERY_MAX_ATTEMPTS:
+            continue
+        day = matchStartDay(team)
+        close_epoch = dayCloseEpoch(day) if day else None
+        if close_epoch is None or now_epoch < close_epoch:
+            continue
+        groups.setdefault((day, state.get('ar', 'U')), []).append(team)
+
+    for (day, archive_reason), teams in sorted(groups.items()):
+        saveDayDump(day, teams, archive_reason=archive_reason or 'U')
+        print(f"FINAL RECOVERY: {len(teams)} unresolved match(es) -> {day}_dump.json")
+        purgeTeams(teams)
+        removeClosedDayRuntimeFiles(day)
+    if groups:
+        persistState(force=True)
+
+
 def closedDayTransientFiles(day):
     return [
-        f"{day}_checkpoint.json",
-        f"{day}_checkpoint.json.bak",
-        f"{day}_checkpoint.json.tmp",
-        f"{day}_run_dump.json",
-        f"{day}_run_dump.json.tmp"
+        f"{day}_checkpoint.json", f"{day}_checkpoint.json.bak", f"{day}_checkpoint.json.tmp",
+        f"{day}_run_dump.json", f"{day}_run_dump.json.tmp"
     ]
 
 
 def removeClosedDayRuntimeFiles(day):
-    if day == currentUKDay():
-        return
+    # Legacy runtime files are no longer written. Remove only after their day is
+    # safely represented in the new dump/results structures.
     removed = []
     for filename in closedDayTransientFiles(day):
         if os.path.isfile(filename):
             os.remove(filename)
             removed.append(filename)
     if removed:
-        print(f"Removed closed-day runtime files for {day}: {', '.join(removed)}")
+        print(f"Removed legacy runtime files for {day}: {', '.join(removed)}")
+
+
+def dueMatchDayGroups(now_epoch=None):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    groups = {}
+    for team in DA_TEAMS:
+        day = matchStartDay(team)
+        close_epoch = dayCloseEpoch(day) if day else None
+        if close_epoch is not None and now_epoch >= close_epoch:
+            groups.setdefault(day, []).append(team)
+    return groups
+
+
+def closeDueMatchDays(now_epoch=None):
+    groups = dueMatchDayGroups(now_epoch)
+    if not groups:
+        return
+
+    # A due day is not dumped merely because the clock crossed 04:00 UTC.
+    # The current Standard cycle is the first dedicated final-recovery attempt;
+    # a remaining match gets one more scheduler opportunity before archival.
+    if ENDPOINT_LAST_ERROR.get('timeline') is not None:
+        print('Closed-day housekeeping deferred: timeline endpoint unavailable')
+        return
+
+    scheduleFinalRecoveryJobs(now_epoch=now_epoch)
+    archiveExhaustedClosedRecoveries(now_epoch=now_epoch)
+    persistState()
 
 
 def purgeTeams(teams):
@@ -2564,35 +3620,43 @@ def purgeTeams(teams):
 
 
 def focusedCycle():
-    entries = focusEntries()
-    if not entries:
+    ko_watch = preKOFocusEntries()
+    ht_watch = htFocusEntries()
+    pending_market_ids = pendingHTMarketIDs()
+    pending_teams = [team for team in DA_TEAMS if getMarketID(team) in pending_market_ids]
+    recovery_teams = finalRecoveryEntries()
+    minute_watch = minuteFocusEntries()
+
+    watched = {}
+    for entry in ko_watch + ht_watch + pending_teams + recovery_teams + minute_watch:
+        event_id = getEventID(entry)
+        if event_id:
+            watched[event_id] = entry
+    if not watched:
         return
 
-    print(f"Focused capture: {len(entries)} market(s)")
-    event_ids = list({getEventID(entry) for entry in entries if getEventID(entry)})
-    timelines = requestTrackedTimelines(event_ids) if event_ids else []
+    print(
+        f"Intermediate timeline watch: {len(watched)} event(s) "
+        f"[KO={len(ko_watch)}, HT={len(ht_watch)}, HT-pending={len(pending_teams)}, "
+        f"recovery={len(recovery_teams)}]"
+    )
+    timelines = requestTrackedTimelines(list(watched.keys())) if watched else []
     live_signals = detectLivePhaseSignals(timelines)
     rememberTimelineStates(timelines, live_signals)
-    processKOEvents(timelines)
-    attempted = processSecondHalfStarts(timelines, live_signals)
-    retryPendingHT(timelines)
-
-    pending_ht = pendingHTMarketIDs()
-    entries = [entry for entry in focusEntries()
-               if getMarketID(entry) not in attempted and getMarketID(entry) not in pending_ht]
-    ht_focus_ids = {getMarketID(entry) for entry in htFocusEntries()}
-    ht_ids = ht_focus_ids - pending_ht
-    ht_entries = [entry for entry in entries if getMarketID(entry) in ht_ids]
-    other_entries = [entry for entry in entries if getMarketID(entry) not in ht_ids]
-
-    results = pollEntries(other_entries, aggressive=True, point='WIN') if other_entries else {}
-    if ht_entries:
-        results.update(pollEntries(ht_entries, aggressive=True, point='HT', allow_history_fallback=False))
-
-    applyPendingKO(timelines, results)
-    applyPendingHT(timelines, results)
     processFinished(timelines)
+    recordFinalRecoveryAttempts(watched.keys())
+    archiveExhaustedClosedRecoveries()
+    processKOEvents(timelines)
+
+    # No blanket 10-second odds polling. HT prices are requested only when a
+    # restart is actually detected or while a just-detected boundary is pending.
+    processSecondHalfStarts(timelines, live_signals)
+    retryPendingHT(timelines)
+    applyPendingHT(timelines)
     persistState()
+
+def intermediateWorkNeeded():
+    return bool(focusEntries() or pendingHTMarketIDs() or finalRecoveryEntries())
 
 
 def htReplenishCycle():
@@ -2613,45 +3677,24 @@ def htReplenishCycle():
     timelines = requestTrackedTimelines(list(watch.keys())) if watch else []
     live_signals = detectLivePhaseSignals(timelines)
     rememberTimelineStates(timelines, live_signals)
+    processFinished(timelines)
     processSecondHalfStarts(timelines, live_signals)
     retryPendingHT(timelines)
     applyPendingHT(timelines)
-    processFinished(timelines)
     persistState()
 
 
 def main():
-    global todays_threshold, filename
-
-    now = betfairAPI.datetime.datetime.today()
-    teamsToDump = [team for team in DA_TEAMS if lib.expiredMatch(team, now, timeDeltaHours)]
-    if teamsToDump:
-        listOfOutputs = list(map(lambda item: item['output'], teamsToDump))
-        df = pd.json_normalize(listOfOutputs)
-        print(tabulate(df, headers='keys', tablefmt='psql'))
-
-    if todays_threshold < now:
-        yesterday = now - betfairAPI.datetime.timedelta(days=1)
-        closed_day = yesterday.strftime('%Y%m%d')
-        filename = f"{closed_day}_dump"
-        df = pd.json_normalize(teamsToDump)
-        df.to_csv(filename + ".csv")
-        lib.saveToJSON(teamsToDump, filename + ".json")
-        mergeDumpStateRecords(closed_day, dumpStateForTeams(teamsToDump))
-
-        thePL = getPL_API(yesterday)
-        print(f"{yesterday.strftime('%d/%m/%Y')} PL is {thePL}")
-
-        todays_threshold = betfairAPI.datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + betfairAPI.datetime.timedelta(hours=(24 + timeDeltaHours))
-        purgeTeams(teamsToDump)
-        FINALIZED_MARKETS.clear()
-        markStateDirty()
-        persistState(force=True)
-        removeClosedDayRuntimeFiles(closed_day)
+    global filename
 
     current_catalogue = betfairAPI.getMarketCatalogueByEventTypeId(soccerEventTypeID) or []
-    near_start_catalogue = betfairAPI.getMarketCatalogueNearStartByEventTypeId(soccerEventTypeID, minutes_before=KO_KEEP_AFTER_SCHEDULE_MINUTES, minutes_after=KO_FOCUS_BEFORE_MINUTES) or []
+    near_start_catalogue = betfairAPI.getMarketCatalogueNearStartByEventTypeId(
+        soccerEventTypeID,
+        minutes_before=KO_KEEP_AFTER_SCHEDULE_MINUTES,
+        minutes_after=KO_FOCUS_BEFORE_MINUTES
+    ) or []
     refreshCatalogueCaches(current_catalogue, near_start_catalogue)
+    scheduleFinalRecoveryJobs()
 
     event_ids = watchedEventIDs(current_catalogue, near_start_catalogue)
     timelines = requestTrackedTimelines(event_ids) if event_ids else []
@@ -2667,31 +3710,45 @@ def main():
 
     live_signals = detectLivePhaseSignals(timelines)
     rememberTimelineStates(timelines, live_signals)
+    processFinished(timelines)
+    recordFinalRecoveryAttempts(event_ids)
+    archiveExhaustedClosedRecoveries()
     processKOEvents(timelines)
     processCatalogueKickOffFallback(current_catalogue)
-    attempted = processSecondHalfStarts(timelines, live_signals)
+    processSecondHalfStarts(timelines, live_signals)
     retryPendingHT(timelines)
 
-    pending_ht = pendingHTMarketIDs()
-    entries = [entry for entry in focusEntries()
-               if getMarketID(entry) not in attempted and getMarketID(entry) not in pending_ht]
-    ht_focus_ids = {getMarketID(entry) for entry in htFocusEntries()}
-    ht_ids = ht_focus_ids - pending_ht
-    ht_entries = [entry for entry in entries if getMarketID(entry) in ht_ids]
-    other_entries = [entry for entry in entries if getMarketID(entry) not in ht_ids]
+    # Ordinary 30-second price sampling only. KO starts three minutes before the
+    # scheduled start and keeps the latest valid pre-KO book. Half-time recess
+    # likewise keeps the latest valid reference without any 10-second price loop.
+    ko_entries = koStandardPriceEntries()
+    ht_entries = htRecessPriceEntries()
+    minute_entries = minuteFocusEntries()
+    standard_by_market = {}
+    for entry in ko_entries + ht_entries + minute_entries:
+        market_id = getMarketID(entry)
+        if market_id:
+            standard_by_market[market_id] = entry
+    standard_entries = list(standard_by_market.values())
 
-    results = pollEntries(other_entries, aggressive=True, point='WIN') if other_entries else {}
-    if ht_entries:
-        results.update(pollEntries(ht_entries, aggressive=True, point='HT', allow_history_fallback=False))
+    results = pollEntries(standard_entries, aggressive=False, point='30S') if standard_entries else {}
+    rememberLatestPreKO(ko_entries, results)
+    rememberLatestHTRecess(ht_entries, results)
 
+    # KO is frozen from the first clean post-KO snapshot on this 30-second cycle.
+    # If the timeline already shows an early goal/red card, the saved pre-KO book
+    # is used instead. Only unusually large pre->post movement is logged.
     applyPendingKO(timelines, results)
     applyPendingHT(timelines, results)
-    processFinished(timelines)
+    closeDueMatchDays()
     persistState()
 
-    print(f"Tracked: {len(DA_TEAMS)} | Catalogue missing: {len(CATALOGUE_MISSING)} | Timeline missing: {len(TIMELINE_MISSING)} | KO focus: {len(preKOFocusEntries())} | HT focus: {len(htFocusEntries())}")
+    print(
+        f"Tracked: {len(DA_TEAMS)} | Catalogue missing: {len(CATALOGUE_MISSING)} | "
+        f"Timeline missing: {len(TIMELINE_MISSING)} | KO watch: {len(preKOFocusEntries())} | "
+        f"HT watch: {len(htFocusEntries())} | 30s prices: {len(standard_entries)}"
+    )
     print(betfairAPI.datetime.datetime.now())
-
 
 def stopAndSave(signum=None, frame=None):
     print("Saving collector state before exit...")
@@ -2703,9 +3760,10 @@ def stopAndSave(signum=None, frame=None):
 
 
 def runCollector():
-    restoreState()
-    compactDumpStateFile(currentUKDay())
-    compactDumpStateFile(currentUKDay(-1))
+    restored = restoreState()
+    if restored:
+        finaliseRestoredMatchesFromState()
+        scheduleFinalRecoveryJobs(restored=True)
     persistState(force=True)
 
     try:
@@ -2714,29 +3772,27 @@ def runCollector():
     except Exception:
         pass
 
+    anchor = time.monotonic()
+    slot = 0
     while True:
         try:
-            main()
+            target = anchor + (slot * INTERMEDIATE_INTERVAL)
+            now = time.monotonic()
+            if target > now:
+                time.sleep(target - now)
+            elif now - target >= INTERMEDIATE_INTERVAL:
+                # Never fire a burst of catch-up requests after a slow or stalled
+                # cycle. Skip missed opportunities and resume at the next slot.
+                slot = int((now - anchor) // INTERMEDIATE_INTERVAL) + 1
+                target = anchor + (slot * INTERMEDIATE_INTERVAL)
+                time.sleep(max(target - time.monotonic(), 0))
 
-            # A bad first HT response remains pending for a fixed 20-second
-            # boundary window. Replenish at 5-second spacing rather than making
-            # a tight retry burst. Every third replenish tick keeps the normal
-            # 15-second focused cycle cadence for unrelated KO/HT work.
-            replenish_tick = 0
-            while pendingHTMarketIDs():
-                time.sleep(HT_REPLENISH_POLL_SECONDS)
-                replenish_tick += 1
-                if replenish_tick % max(int(FOCUSED_DELAY / HT_REPLENISH_POLL_SECONDS), 1) == 0 and focusEntries():
-                    focusedCycle()
-                else:
-                    htReplenishCycle()
-
-            if focusEntries():
-                time.sleep(FOCUSED_DELAY)
+            if slot % (STANDARD_INTERVAL // INTERMEDIATE_INTERVAL) == 0:
+                main()
+            elif intermediateWorkNeeded():
                 focusedCycle()
-                time.sleep(max(NORMAL_DELAY - FOCUSED_DELAY, 0))
-            else:
-                time.sleep(NORMAL_DELAY)
+
+            slot += 1
         except KeyboardInterrupt:
             try:
                 persistState(force=True)
@@ -2751,6 +3807,8 @@ def runCollector():
             except Exception as dump_err:
                 print(f"State save error: {dump_err}")
             time.sleep(NORMAL_DELAY)
+            anchor = time.monotonic()
+            slot = 0
 
 
 if __name__ == '__main__':

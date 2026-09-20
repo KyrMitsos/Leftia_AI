@@ -1,97 +1,115 @@
-Leftia_AI v0.1.7
+Leftia_AI v0.2.0
 
-Separate experimental version of the original Leftia collector.
-The existing 25 output columns are unchanged.
+Major internal-state, persistence and scheduler redesign. The existing 25-column
+YYYYMMDD_results.csv schema and the KO/HT market-selection rules remain unchanged.
 
-Collection and recovery:
-- Betfair website JSON remains the primary price source and DelayAppKey remains the normal API key.
-- KO is treated as a boundary price. Leftia retains the latest clean pre-kick-off snapshot (up to 3 minutes back) and the first website snapshot immediately after the kick-off/in-play transition.
-- If the first post-kick-off snapshot arrives within 8 seconds and is within 1-2 Betfair ticks per runner (and a coherent whole book) of the latest pre-kick-off snapshot, the post-boundary snapshot is used as the best representation of the actual kick-off price.
-- If the post-boundary price has materially moved, arrived too late or is otherwise inconsistent, the latest pre-kick-off snapshot is used. A post-boundary snapshot can stand alone only when the kick-off boundary came from a real timeline observation, never from a late/synthetic rediscovery.
-- The wider 30-second reconciliation period remains only to resolve source timing disagreement and missing pre-play state; it does not license taking ordinary later in-play odds as KO.
-- Pre-KO polling continues for delayed starts until the actual start is observed (bounded by the existing 20-minute near-start watch).
-- A match first rediscovered materially late is never assigned current late-match prices as KO.
-- HT is the first kosher customer-facing price at the second-half restart boundary. One price request is made immediately at SecondHalfKickOff. If that response is missing or incoherent, HT remains pending and is retried every 5 seconds for at most 20 seconds while the score still equals the recorded HT score and no second-half goal has occurred.
-- A genuine SecondHalfKickOff marker with a valid timestamp supplies the HT boundary directly. If Betfair gives the marker a 1970 timestamp, elapsed time is used only as phase corroboration: the wall-clock HT boundary must come from the observed half-time market reopening.
-- HT market-reopen fallback no longer requires a clean observation before the half-time suspension; repeated suspension plus a timely in-play reopen is enough strong evidence.
-- A separate small clean-price history survives suspended/corrupt half-time polls and is checkpointed for restart-safe BACK/LAY inference.
-- Extreme coherent Match Odds partial books can use the exchange limits when liquidity disappears: e.g. BACK [missing, 450, 100] / LAY [1.01, missing, missing] becomes BACK [1.01, 450, 100] / LAY [1.01, 1000, 1000].
-- Limit completion is only for live/open MATCH_ODDS evidence at genuine 1.01/1000-style boundaries; mid-range missing prices are not invented and this rule is not applied to impossible/settled OU markets.
-- HT focused polling normally starts 10 minutes after FirstHalfEnd.
-- If FirstHalfEnd is missed, a recovery HT watch can start from the persisted actual first-half kick-off time.
-- A pre-SecondHalfKickOff price can never itself become HT.
-- If the SecondHalfKickOff transition itself is missed, Leftia requires repeated half-time suspension, a realistic half-time age, the first available in-play market reopening and second-half elapsed/transition corroboration. The reopening observation supplies the wall-clock boundary.
-- Old 1970 Betfair transition timestamps are never replaced with the current time when the match is already well past the transition.
-- Tracked event IDs continue to be queried even after the match disappears from the current market catalogue.
-- Remembered market IDs continue to be used for KO/HT/minute-window price capture when catalogue discovery disappears.
-- Missing intermediate match states do not block later valid states such as SecondHalfKickOff or Finished.
-- A populated Betfair fullTimeScore is also accepted as strong final-state evidence.
-- Complete broadly plausible first price snapshots are accepted even when no recent clean-book history yet exists.
-- Generic website recovery remains conservative. HT boundary replenishment is separate: one immediate request then at most one fresh request every 5 seconds inside the fixed 20-second restart window.
+Persistent files
+----------------
+- live_state.json is the only live crash/restart state file.
+- live_state.json.bak is the previous successfully written live state.
+- YYYYMMDD_results.csv remains the normal final output.
+- YYYYMMDD_dump.json is the single rich archive for unresolved/problematic matches.
+- YYYYMMDD_log.txt is the event/state-change log.
+- codes.csv is the compact-code legend.
 
-Restart safety:
-- YYYYMMDD_run_dump.json remains in use.
-- YYYYMMDD_checkpoint.json stores DA_TEAMS plus active price history, KO/HT transition times, latest timelines, remembered catalogues and active capture state.
-- KO capture state and pre-in-play price history are persisted so a restart can still freeze a valid pre-KO snapshot; restart recovery never substitutes an in-play price.
-- The checkpoint is atomically replaced and keeps a .bak copy of the previous successful checkpoint.
-- State is checkpointed after collection-state changes and immediately after KO, HT and finalisation.
-- Ctrl+C, SIGTERM and handled exceptions save state before exit.
-- On restart the newest current/previous-day checkpoint is restored; legacy run_dump.json remains supported as a fallback.
-- Active legacy HT boundaries that were previously estimated from elapsed minutes alone are discarded on restore unless HT was already frozen; the new collector waits for an explicit timestamp or observed market reopening.
-- Result writing is duplicate-safe after a restart.
-- Finalised markets cannot be reinitialised from a lingering Betfair catalogue entry.
+There are no new YYYYMMDD_checkpoint.json, YYYYMMDD_run_dump.json,
+YYYYMMDD_dump.csv or YYYYMMDD_dump_state.json files.
 
-Problem matches:
-- YYYYMMDD_dump.csv and YYYYMMDD_dump.json are retained.
-- YYYYMMDD_dump_state.json is a compact exceptional-evidence sidecar only for unresolved, missing or reconstructed captures.
-- It stores only small KO/HT evidence windows, essential transition/goal evidence, scores and source-failure flags; it does not duplicate full catalogue/team objects.
-- Existing oversized v0.1.3 dump_state files are compacted on startup and duplicate records for the same event/market are reduced to the richer record.
-- Catalogue/timeline disappearance and return are logged once per state change rather than every polling cycle.
+Canonical match state
+---------------------
+- Active state and dump state use the same compact schema-v2 MatchRecord.
+- A MatchRecord stores fixture identity, immutable Betfair start date, result/output
+  fields, compact goal/boundary timeline evidence, KO/HT selected evidence, a small
+  amount of best price context, problem flags and only the runtime data needed to
+  resume safely.
+- Rolling price histories are not persisted. Only selected/best useful snapshots are
+  retained across a restart. The running process may use short transient histories.
+- Timeline evidence keeps only Goal/KickOff/FirstHalfEnd/SecondHalfKickOff/Finished
+  information rather than unrelated cards and repeated full Betfair objects.
+- Compact archive/problem codes are documented in codes.csv.
 
-Odds handling:
-- Match Odds use inverse-price book plausibility and recent clean market behaviour.
-- A complete plausible first snapshot is not rejected simply because its book is wider than the default target when no historical anchor exists.
-- Cross-poll repair is constrained by runner history.
-- Missing BACK values can be inferred from recent stable BACK/LAY tick spread.
-- If recovery is not reliable the existing odds field remains 0.
-- Optional minute-based focused windows remain available through FOCUSED_MINUTE_WINDOWS in main.py.
+Write minimisation / SSD behaviour
+----------------------------------
+- State lives in RAM during normal operation.
+- A dirty flag is raised only when collector state changes.
+- Before writing, the canonical JSON is hashed. If it is identical to the last
+  successfully saved representation, no disk write occurs even when persistence is
+  requested.
+- Polling that returns no meaningful state change therefore causes no live-state write.
+- Actual writes use compact JSON and an atomic tmp -> live_state.json replacement.
+- The previous good live_state.json is retained as live_state.json.bak. This is a
+  rename/rotation safeguard, not a second routine full-state write.
+- On restart the main file is tried first, then .bak.
 
-Two-decimal output:
-- HT_1/X, HT_2/X, HT_1/2, MULTI_DT1, P/L_DT1, MULTI_ZZCX and P/L_ZZCX are written with at most two decimal places.
-
-Run:
-    python main.py
-
-Closed-day state retention
---------------------------
-- YYYYMMDD_checkpoint.json and YYYYMMDD_run_dump.json are runtime recovery files, not permanent evidence files.
-- After the 04:00 next-day close has safely written the retained dump files and current-day recovery state, the closed day's checkpoint/run-dump files (including checkpoint backup/temp files) are removed.
-- Useful exceptional collector evidence is promoted before runtime cleanup into the compact YYYYMMDD_dump_state.json sidecar.
-- If a match is finalised into YYYYMMDD_results.csv but still has missing KO/HT/HT-score data, used MIX/INF reconstruction or required a strong fallback second-half signal, its compact collector evidence is written before the live state is discarded.
-- Normal fully captured result rows do not retain redundant runtime history after finalisation.
-
-v0.1.6 HT boundary patch
-------------------------
-- FirstHalfEnd immediately enables focused HT monitoring; half-time prices are never saved as HT.
-- KickOff, FirstHalfEnd and SecondHalfKickOff are recognised from current inPlayMatchStatus and updateDetails.
-- A live SecondHalfKickOff triggers an immediate fresh Match Odds request in the same processing cycle.
-- Invalid 1970 transition timestamps are ignored as clock times; a live restart signal at BF minute 45-48 uses collector observation time.
-- Narrow fallback only: observed FirstHalfEnd + BF minute 46-48 + unchanged HT score + no second-half goal.
-- Timeline partial responses retry missing event IDs once in smaller batches.
-- Timeline and website-price endpoint back-off states are independent.
-- HTDBG log entries record signal source/timing, price request/response times, score, capture result and reason.
-- Late second-half discovery never backfills HT.
-- Existing KO boundary behaviour and Match Odds 1.01/1000 limit inference are unchanged.
-
-
-
-v0.1.7 HT replenishment patch
+Restart and old-file migration
 ------------------------------
-- Keeps the v0.1.6 phase-signal and KO logic unchanged.
-- Removes the tight sub-second HT retry burst.
-- SecondHalfKickOff still triggers one immediate fresh Match Odds request.
-- If that first response is unusable, HT remains pending instead of being frozen immediately to 0/0/0.
-- Pending HT is retried at 5-second spacing for a maximum 20-second fixed boundary window.
-- Each retry requires a fresh timeline for that event. If the score differs from the recorded HT score or a second-half goal is recorded, capture stops and HT is left missing.
-- After the 20-second window, HT is frozen missing; later second-half prices are never backfilled as HT.
-- Pending HT markets are excluded from generic focused price polling so the collector does not duplicate requests.
+- A restart can occur hours or days later. The collector reloads live_state.json and
+  resumes matches whose match day is still open.
+- Records whose original match day is already closed are moved to that original
+  YYYYMMDD_dump.json, never to today's files.
+- On first upgrade from the old architecture, legacy YYYYMMDD_checkpoint.json and
+  YYYYMMDD_run_dump.json are accepted as live-state sources.
+- Legacy YYYYMMDD_dump.json and YYYYMMDD_dump_state.json are merged by event and
+  converted to the new schema-v2 YYYYMMDD_dump.json representation.
+- Old rolling forensic histories are reduced during migration rather than copied
+  indefinitely into the new format.
+- The collector writes only the new format after migration.
+
+Result and dump routing
+-----------------------
+- Each match is permanently associated with the UTC date of its Betfair start datetime.
+- As soon as a Finished result is established it is appended exactly once to that
+  start-date's YYYYMMDD_results.csv, even when it finishes after midnight.
+- The four-hour rule is only the match-day close grace: at 04:00 UTC the next day,
+  unresolved matches for that start date become eligible for that date's dump.
+- If the timeline endpoint is unavailable during normal day-close housekeeping, closing
+  is deferred rather than discarding recoverable matches.
+- A finished row with missing/reconstructed evidence can also keep a compact archive
+  record with archive code P so later Data Consolidation can improve it.
+- Dump archive codes: U=unresolved, P=finalized/problematic, R=stale record archived
+  after a later restart.
+
+Scheduler
+---------
+The scheduler is relative to this collector instance, not PC wall-clock :00/:10/:20.
+If a Standard cycle starts at 14:22:03, opportunities are:
+
+    14:22:03  STANDARD
+    14:22:13  INTERMEDIATE opportunity
+    14:22:23  INTERMEDIATE opportunity
+    14:22:33  STANDARD
+
+- STANDARD interval: 30 seconds. Full catalogue/timeline/finalisation processing.
+- INTERMEDIATE opportunities: +10 and +20 seconds inside each Standard frame.
+- An Intermediate opportunity does nothing unless there is boundary-sensitive or
+  temporarily bad/missing information requiring extra attention.
+- Important transitions still trigger their immediate price request in the processing
+  cycle that observes the transition.
+- A failed HT boundary request remains pending and can retry at the next +10/+20
+  opportunity. No separate 5-second loop and no tight retry burst exists.
+- Missed scheduler opportunities after a slow/network-stalled cycle are skipped rather
+  than fired as a catch-up request burst.
+
+Logging
+-------
+- Log rows now contain AtUTC separately from MatchDate. The old Timestamp field was the
+  fixture start date and therefore made repeated polling diagnostics look simultaneous.
+- Price diagnostics are edge-triggered: the same Code/Point/Details state for a match
+  is not written repeatedly on every poll. A changed condition is logged once and can
+  be logged again if the state later changes away and returns.
+
+KO / HT capture
+---------------
+- Existing KO boundary selection from v0.1.8 is preserved.
+- FirstHalfEnd enables HT boundary attention but its price is not itself labelled HT.
+- SecondHalfKickOff triggers an immediate fresh Match Odds request.
+- If the fresh HT book is missing/incoherent, HT remains pending and retries only on
+  scheduled Intermediate/Standard opportunities within the short restart window.
+- Retries require fresh safe timeline evidence: unchanged HT score and no second-half
+  goal. Later second-half prices are never backfilled as HT.
+- Match Odds boundary repair remains conservative, including defensible 1.01/1000
+  exchange-limit cases.
+
+Run
+---
+    python main.py

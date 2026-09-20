@@ -1,0 +1,31 @@
+domain,key,code,description
+log,bad_market,BAD,Implausible market
+log,retry_recovered,RET,Recovered by repeat poll
+log,mixed_recovery,MIX,Recovered from adjacent polls
+log,inferred_price,INF,Price inferred from available evidence
+log,missing_price,MISS,No reliable price
+log,http_problem,HTTP,HTTP or source problem
+log,auth_recovery,AUTH,Session recovery
+log,finished_corner,FT,Finished match corner case
+log,late_start,LATE,Match first seen after kick off
+log,last_good,LAST,Used last consistent observed market
+log,catalogue_missing,CATMISS,Tracked event disappeared from catalogue
+log,catalogue_returned,CATRET,Tracked event returned to catalogue
+log,timeline_missing,TLMISS,Tracked event disappeared from timeline feed
+log,timeline_returned,TLRET,Tracked event returned to timeline feed
+log,second_half_fallback,SHFB,Second half start recovered from strong fallback evidence
+log,first_half_fallback,KOFB,First half start recovered from strong fallback evidence
+log,ht_capture_diagnostic,HTDBG,HT boundary capture diagnostic
+log,date_route_fallback,DTFB,Result date fell back because match start date was unavailable
+archive,archive_unresolved,U,Unresolved after the match-day close point
+archive,archive_problematic,P,Finished result saved but forensic evidence retained
+archive,archive_restart,R,Stale live-state record archived after a later restart
+flag,ko_missing,K0,KO Match Odds missing
+flag,ht_missing,H0,HT Match Odds missing
+flag,score_missing,S0,Half-time score missing
+flag,catalogue_missing,CM,Catalogue observation missing
+flag,timeline_missing,TM,Timeline observation missing
+price,observed,O,Observed coherent price snapshot
+price,repaired,R,Repaired from defensible market evidence
+price,inferred,I,Inferred from defensible market evidence
+price,missing,M,No reliable price snapshot
