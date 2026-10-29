@@ -1,14 +1,12 @@
 import requests
 import os.path
 import csv
-import pandas as pd
 from requests.structures import CaseInsensitiveDict
 import src.betfairAPI.betfairAPI as betfairAPI
 import src.ufuncs as lib
 import src.collection as collection
 import src.state_store as state_store
 from functools import reduce
-from tabulate import tabulate
 import io
 import time
 import copy  # for copy.deepcopy
@@ -16,6 +14,13 @@ import traceback
 import statistics
 import math
 from zoneinfo import ZoneInfo
+
+# OPERATIONAL VISIBILITY / REGRESSION GUARD (2026-10-08):
+# Keep the original successful-request and catalogue/timeline console output.
+# Leftia is run directly with `python3 main.py`, so normal stdout is useful live
+# diagnostics and is not made into /var/log files by Python itself. Do not remove
+# these prints merely as an efficiency cleanup; change them only if the runtime
+# deployment model or the user's logging requirements deliberately change.
 
 # To append a dict to a csv (i.e. how I will keep stats of trades)
 # https://www.geeksforgeeks.org/how-to-append-a-new-row-to-an-existing-csv-file/
@@ -200,11 +205,35 @@ def saveDictArrayToCSV(filename, dictArray, mode='w'):
         if dictArray is not None:
             # Results CSV column order is part of the file format. Never derive it
             # from a restored/migrated dictionary because JSON key order may differ.
-            keys = list(lib.eventTemplateKeys)
+            keys = list(RESULT_FIELDS)
 
             if file_exists and 'a' in mode:
                 with io.open(filename, 'r', encoding='utf-8', newline='') as infile:
                     existing_header = next(csv.reader(infile), [])
+
+                # One-time schema migration for a results file created by <=v0.2.3:
+                # drop only the obsolete STAKE column, without altering any values.
+                legacy_header = list(lib.eventTemplateKeys)
+                if existing_header == legacy_header and 'STAKE' in existing_header:
+                    temp_name = filename + '.stake_schema.tmp'
+                    with io.open(filename, 'r', encoding='utf-8', newline='') as infile:
+                        old_rows = list(csv.DictReader(infile))
+                    with io.open(temp_name, 'w', encoding='utf-8', newline='') as outfile:
+                        writer = csv.DictWriter(outfile, fieldnames=keys, extrasaction='ignore', lineterminator='\r')
+                        writer.writeheader()
+                        for old_row in old_rows:
+                            migrated = {key: old_row.get(key, '') for key in keys}
+                            for pl_key in [key for key in keys if key.startswith('P/L_')]:
+                                multi_key = 'MULTI_' + pl_key[4:]
+                                try:
+                                    multi = float(old_row.get(multi_key, ''))
+                                    migrated[pl_key] = round(multi - 1.0, 2)
+                                except Exception:
+                                    pass
+                            writer.writerow(migrated)
+                    os.replace(temp_name, filename)
+                    existing_header = keys
+
                 if existing_header != keys:
                     raise ValueError(
                         f"results header mismatch in {filename}; refusing unsafe append"
@@ -250,72 +279,121 @@ def getCleanExchangePricesfromWebsite(marketIDs, force=False):
     return marketBookFromWebsite
 
 
-def applyModel__DT1(data):
-    choice = ""
-    output = data['output']
-    details = data['updateDetails']  # for extracting RED CARDS (fav and unfav)
-    redCards = list(filter(lambda x: x['type'] == 'RedCard', details))
-    homeReds = list(filter(lambda x: x['team'] == 'home', redCards))
-    awayReds = list(filter(lambda x: x['team'] == 'away', redCards))
+def _firstHalfRedCards(details):
+    """Return red-card events that were known by half time only.
 
-    if (output['HT_Home'] > output['HT_Away']):
-        choice = "1" if not homeReds else "NO"
-    elif (output['HT_Home'] < output['HT_Away']):
-        choice = "2" if not awayReds else "NO"
+    Models are evaluated at HT. Re-evaluating them at full time must not let a
+    second-half dismissal retroactively alter the original HT decision.
+    """
+    cards = []
+    boundary_seen = False
+    for item in _safeDetails(details):
+        event_type = str(item.get('type') or item.get('updateType') or '')
+        normalised = event_type.lower().replace('_', '')
+        if event_type in {'FirstHalfEnd', 'SecondHalfKickOff'}:
+            boundary_seen = True
+            continue
+        if normalised not in {'redcard', 'sendingoff', 'dismissal'}:
+            continue
+        elapsed = None
+        try:
+            raw = item.get('elapsedRegularTime')
+            if raw in [None, '']:
+                raw = item.get('matchTime')
+            if raw not in [None, '']:
+                elapsed = float(raw)
+        except Exception:
+            elapsed = None
+        if elapsed is not None:
+            if elapsed <= 45:
+                cards.append(item)
+        elif not boundary_seen:
+            cards.append(item)
+    return cards
+
+
+def _strategyPriceAvailable(output, selection):
+    if not selection or selection == 'NO':
+        return selection == 'NO'
+    try:
+        return float(output.get(f"HT_{selection}") or 0) > 1.0
+    except Exception:
+        return False
+
+
+def applyModel__DT1(data):
+    output = data.get('output', {}) if isinstance(data, dict) else {}
+    details = _safeDetails(data.get('updateDetails')) if isinstance(data, dict) else []
+    red_cards = _firstHalfRedCards(details)
+    home_reds = [item for item in red_cards if item.get('team') == 'home']
+    away_reds = [item for item in red_cards if item.get('team') == 'away']
+
+    home = _scoreValue(output.get('HT_Home'))
+    away = _scoreValue(output.get('HT_Away'))
+    if home is None or away is None:
+        return 'NO'
+
+    if home > away:
+        selection = '1' if not home_reds else 'NO'
+    elif home < away:
+        selection = '2' if not away_reds else 'NO'
     else:
-        if (output['KO_1'] >= 2.1) and (output['KO_2'] < 1.9):
-            choice = "2/X" if not awayReds else "NO"
+        try:
+            ko_1 = float(output.get('KO_1') or 0)
+            ko_2 = float(output.get('KO_2') or 0)
+        except Exception:
+            return 'NO'
+        if ko_1 <= 1.0 or ko_2 <= 1.0:
+            return 'NO'
+        if ko_1 >= 2.1 and ko_2 < 1.9:
+            selection = '2/X' if not away_reds else 'NO'
         else:
-            choice = "1/X" if not homeReds else "NO"
-    return choice
+            selection = '1/X' if not home_reds else 'NO'
+
+    # A theoretical selection without a real HT price is not an executable bet.
+    # Record it as NO rather than leaving MODEL_* blank or implying a bet existed.
+    return selection if _strategyPriceAvailable(output, selection) else 'NO'
 
 
 def applyModel__ZZCX(data):
-    choice = ""
-    output = data['output']
-    validScores = ['0', '1']  # scores for ties, i.e. 0-0 and 1-1
-
-    if ((output['HT_Home'] in validScores) and output['HT_Home'] == output['HT_Away']):
-        choice = "X"
-    else:
-        choice = "NO"
-    return choice
-
-
-
+    output = data.get('output', {}) if isinstance(data, dict) else {}
+    home = _scoreValue(output.get('HT_Home'))
+    away = _scoreValue(output.get('HT_Away'))
+    if home is None or away is None:
+        return 'NO'
+    selection = 'X' if home == away and home in {0, 1} else 'NO'
+    return selection if _strategyPriceAvailable(output, selection) else 'NO'
 
 def getFINAL(data):
-    if (data['FT_Home'] > data['FT_Away']):
-        choice = "1"
-    elif (data['FT_Home'] < data['FT_Away']):
-        choice = "2"
-    else:
-        choice = "X"
-    return choice
-
+    home = _scoreValue(data.get('FT_Home')) if isinstance(data, dict) else None
+    away = _scoreValue(data.get('FT_Away')) if isinstance(data, dict) else None
+    if home is None or away is None:
+        return ''
+    if home > away:
+        return '1'
+    if home < away:
+        return '2'
+    return 'X'
 
 def getMULTI(data, model):
-    if (data[model] == "NO"):
+    selection = str(data.get(model, '') or '').strip()
+    if not selection or selection == 'NO':
         return 1.0
-    else:
-        if data['FINAL'] in data[model]:
-            key = f"HT_{data[model]}"
-            return data[key]
-        else:
-            return 0.0
-
-
-# def getSTATUS(data, model):
-#     if data['FINAL'] in data[model]:
-#         return "WIN"
-#     elif data[model] == "NO":
-#         return "NO"
-#     else:
-#         return "LOSS"
-
+    final = str(data.get('FINAL', '') or '').strip()
+    if not final:
+        return 1.0
+    if final not in selection:
+        return 0.0
+    key = f"HT_{selection}"
+    try:
+        price = float(data.get(key) or 0)
+    except Exception:
+        return 1.0
+    return price if price > 1.0 else 1.0
 
 def getPL(data, multi):
-    return data['STAKE'] * (data[multi] - 1)
+    """Return strategy profit/loss in staking units (1 SU risked)."""
+    return float(data[multi]) - 1.0
 
 
 
@@ -372,13 +450,14 @@ outputTemplate = lib.render(["", "", "", "",    # "Date", "Competition", "Home",
                              0.0, 0.0, 0.0,     # "KO_1", "KO_2", "KO_X"
                              0.0, 0.0, 0.0,     # "HT_1", "HT_2", "HT_X"
                              0.0, 0.0, 0.0,     # "HT_1/X", "HT_2/X", "HT_1/2"
-                             0.0, "",           # "STAKE", "FINAL"
+                             0.0, "",           # legacy "STAKE", "FINAL" slots in lib.render
                              "", 0.0, 0.0,    # "MODEL_DT1", "MULTI_DT1", "P/L_DT1"
                              "", 0.0, 0.0,    # "MODEL_ZZCX", "MULTI_ZZCX", "P/L_ZZCX"
                              ])
+outputTemplate.pop('STAKE', None)
 
-
-RESULT_FIELDS = list(lib.eventTemplateKeys)
+# STAKE is no longer a results field. Strategy P/L is stored in staking units.
+RESULT_FIELDS = [key for key in lib.eventTemplateKeys if key != 'STAKE']
 
 
 def canonicalOutput(source):
@@ -471,19 +550,103 @@ soccerEventTypeID = '1'  # '1' Corresponds to Soccer
 # -----------------------------------------------------
 
 
+LEFTIA_AI_VERSION = '0.2.12'
+
+# Betfair API sessions can become unusable after a long sleep/hibernation.
+# listMarketCatalogue should always return a list; the legacy API wrapper
+# returns {} when an HTTP/API call fails. Use that distinction to refresh the
+# session once and retry without treating a failed catalogue as an empty one.
+CATALOGUE_SESSION_REFRESH_COOLDOWN_SECONDS = 60
+LAST_CATALOGUE_SESSION_REFRESH = 0.0
+CATALOGUE_API_UNAVAILABLE = False
 STANDARD_INTERVAL = 30
-INTERMEDIATE_INTERVAL = 10
 NORMAL_DELAY = STANDARD_INTERVAL
-FOCUSED_DELAY = INTERMEDIATE_INTERVAL
-KO_FOCUS_BEFORE_MINUTES = 3
-KO_BACKUP_MAX_AGE_SECONDS = 180
-KO_KEEP_AFTER_SCHEDULE_MINUTES = 20
-# Price collection remains on the ordinary 30-second cadence. Allow enough
-# time for the first standard cycle after a real kick-off observation.
+RECOVERY_INTERVAL = 15
+# One immediate post-boundary request plus six 15-second retries.
+POST_RECOVERY_RETRIES = 6
+POST_RECOVERY_TOTAL_POLLS = POST_RECOVERY_RETRIES + 1
+BOUNDARY_RECOVERY_SECONDS = RECOVERY_INTERVAL * POST_RECOVERY_RETRIES  # 90 seconds
+# Allow tiny scheduler drift so the T+90s final slot is not lost by milliseconds.
+BOUNDARY_FINAL_SLOT_GRACE_SECONDS = 2
+ODDS_BOOK_TARGET = 1.03
+ODDS_BOOK_TOLERANCE = 0.05
+ODDS_BOOK_LOW = ODDS_BOOK_TARGET - ODDS_BOOK_TOLERANCE
+ODDS_BOOK_HIGH = ODDS_BOOK_TARGET + ODDS_BOOK_TOLERANCE
+# Fresh SHKO discovery is intentionally conservative.  Betfair's top-level
+# elapsedRegularTime is the same live-position field used to render the website
+# minute; only 45/46 is accepted as a *new* SHKO whiff.
+SHKO_FRESH_MINUTE_MIN = 45.0
+SHKO_FRESH_MINUTE_MAX = 46.0
+
+# ---------------------------------------------------------------------------
+# CAPTURE DESIGN / REGRESSION GUARDS
+# ---------------------------------------------------------------------------
+# Keep these comments with the implementation until the behaviour they explain
+# is deliberately superseded.  They record failures seen in live collection so
+# that a later clean-up does not remove a line that looks redundant but protects
+# a real edge case.
+#
+# 1) Odds come from Betfair's WEBSITE readonly JSON endpoint, not from delayed
+#    Exchange API price calls.  The API catalogue is trusted for market identity
+#    and whether Betfair still considers a match active/relevant.
+#
+# 2) PRE insurance is intentionally simple: every normal 30-second heartbeat,
+#    KO from scheduled KO-2m to scheduled KO; HT from FirstHalfEnd+13m until the
+#    restart is observed.  Keep the best real observation; do not numerically
+#    repair odds.  PRE exists so a suspended/corrupt POST window does not leave a
+#    match empty.
+#
+# 3) POST capture is the same mechanism for KO and HT: immediate T+0 website
+#    price request, then at most six 15-second retries (+15..+90).  First
+#    acceptable book wins.  A later goal/red card stops future polling but must
+#    NEVER erase a safe POST observation captured before that event.
+#
+# 4) v0.2.11 regression: a market newly entering Betfair's active catalogue was
+#    logged as a KO hint but did not actually arm POST recovery.  AL Sadd U20 v
+#    Al-Arabi U20 (2026-10-08) therefore kept a horrible PRE book and made zero
+#    POST attempts.  A NEWLY_ACTIVE catalogue transition is therefore a genuine
+#    KO "whiff" and MUST immediately arm the same POST scheduler as timeline KO.
+#    This also protects unexpectedly early/delayed KOs (e.g. Slovenia U19 v
+#    Serbia U19) when the catalogue sees the live transition before the timeline.
+#
+# 5) v0.2.11 regression: no-timestamp SecondHalfKickOff required the immediately
+#    previous website status to be FirstHalfEnd.  Betfair sometimes omits FHE or
+#    supplies a literal 1970-01-01 updateTime, causing valid HT restarts to be
+#    ignored.  A literal 1970 updateTime means "timestamp unavailable"; ignore
+#    that timestamp only, not the whole event.  The top-level/bulk
+#    elapsedRegularTime that drives Betfair's website minute is checked on every
+#    timeline response and is the preferred live-position indicator.
+#
+# 6) A newly observed SHKO may start HT capture only while the bulk website minute
+#    is 45 or 46.  Minute 47+ is deliberately too late for a *new* HT boundary,
+#    even if a persistent SHKO status is still visible.  Once an HT boundary was
+#    legitimately caught at 45/46, its already-started +15..+90 recovery may of
+#    course continue according to the normal recovery clock.  This conservative
+#    guard prevents minute-50 (or later) prices being mislabeled as HT.
+#
+# 7) If an explicit transition detail is missing, bulk elapsedRegularTime may
+#    still reveal movement.  A fresh minute 0/1 can provide a KO whiff; a fresh
+#    minute 45/46 can provide an SHKO whiff only when half-time was already known
+#    (stored FirstHalfEnd / previous FHE).  Do NOT infer SHKO from minute 46 alone:
+#    first-half stoppage time can also reach that number.
+#
+# 8) Persist only recovery-relevant changes (new/better PRE or POST evidence,
+#    boundary, material event, freeze/finalise).  Ordinary minute changes and
+#    retry-clock movement alone must not turn live_state.json into a 15-second
+#    write loop.
+# ---------------------------------------------------------------------------
+KO_FOCUS_BEFORE_MINUTES = 2
+KO_BACKUP_MAX_AGE_SECONDS = 120
+KO_CATALOGUE_LOOKBACK_MINUTES = 20
+# KO prices are sampled every 30 seconds. The pre-KO book is locked at the
+# scheduled start. A post-KO book is acceptable only when the website's live
+# timer/status says we are still right at the start.
 KO_POST_BOUNDARY_SECONDS = STANDARD_INTERVAL + 10
 KO_BOUNDARY_RECONCILE_SECONDS = KO_POST_BOUNDARY_SECONDS + 5
+KO_POST_WEBSITE_MAX_MINUTES = 1
+KO_POST_CONFIRM_WAIT_SECONDS = STANDARD_INTERVAL + 10
 KO_LIVE_DISCOVERY_MAX_AFTER_SCHEDULE_SECONDS = 120
-KO_LIVE_ELAPSED_MAX_MINUTES = 3
+KO_LIVE_ELAPSED_MAX_MINUTES = BOUNDARY_RECOVERY_SECONDS / 60.0
 KO_SYNTHETIC_START_SOURCES = {
     'catalogue_inplay_live', 'catalogue_inplay_late', 'late_rediscovery', 'catalogue_inplay'
 }
@@ -493,25 +656,20 @@ KO_START_SOURCE_PRIORITY = {
     'catalogue_inplay': 0,
     'catalogue_inplay_live': 1,
     'status_observed': 2,
+    'website_status': 3,
     'explicit_observed': 3,
+    'website_elapsed': 4,
     'explicit_time': 4,
 }
 FORENSIC_MAX_SNAPSHOTS = 8
-HT_FOCUS_AFTER_FIRST_HALF_MINUTES = 0
-HT_MARKET_REOPEN_MINUTES = 12
-HT_BOUNDARY_CAPTURE_SECONDS = 3
-HT_REPLENISH_POLL_SECONDS = INTERMEDIATE_INTERVAL
-HT_REPLENISH_WINDOW_SECONDS = 21
+HT_FOCUS_AFTER_FIRST_HALF_MINUTES = 13
+HT_REPLENISH_WINDOW_SECONDS = BOUNDARY_RECOVERY_SECONDS
 DAY_CLOSE_GRACE_HOURS = 4
 FINAL_RECOVERY_AFTER_START_SECONDS = 3 * 60 * 60
 FINAL_RECOVERY_MAX_ATTEMPTS = 2
-RECOVERY_RETRIES = 1
-RECOVERY_WAIT = 0.5
+RECOVERY_RETRIES = 2
 TIMELINE_BATCH_SIZE = 50
 TIMELINE_RETRY_BATCH_SIZE = 10
-HT_SIGNAL_FRESH_SECONDS = 20
-HT_SIGNAL_MINUTE_MIN = 45
-HT_SIGNAL_MINUTE_MAX = 48
 FOCUSED_MINUTE_WINDOWS = []  # e.g. [(50, 2, 2), (55, 2, 2)]
 
 PRICE_HISTORY = {}
@@ -524,11 +682,19 @@ FIRST_HALF_END_SCORES = {}
 SECOND_HALF_START_TIMES = {}
 SECOND_HALF_START_SOURCE = {}
 HT_REPLENISH_LAST_ATTEMPT = {}
-# Latest complete/plausible 30-second snapshot observed during the half-time recess.
-# This is reference/forensic state only; HT output still requires a post-restart capture.
+# Best real pre-restart snapshot observed from FirstHalfEnd +13 minutes.
+# It is persisted as HT insurance and is used if a usable post-restart triplet
+# cannot be obtained.
 HT_RECESS_STATE = {}
+HT_CAPTURE_STATE = {}
 NEAR_START_CATALOGUE = {}
 CURRENT_INPLAY_CATALOGUE = {}
+# The successful Betfair catalogue call is authoritative for which matches are
+# currently active.  We only use *transitions into* that list as a KO hint; the
+# first catalogue after process start establishes a baseline so a mid-match
+# restart cannot mislabel current odds as KO.
+NEWLY_ACTIVE_CATALOGUE_IDS = set()
+CATALOGUE_ACTIVE_BASELINE_READY = False
 LATEST_TIMELINES = {}
 KO_MISSING = set()
 KO_CAPTURE_STATE = {}
@@ -662,17 +828,40 @@ def scheduledStart(entry):
     return parseBetfairTimestamp(entry.get('description', {}).get('marketTime') or entry.get('event', {}).get('openDate'))
 
 
-def eventElapsedMinutes(event):
-    values = []
+def bulkElapsedMinutes(event):
+    """Return Betfair's top-level live match minute, if supplied.
+
+    This is deliberately separate from updateDetails.  The top-level
+    elapsedRegularTime is the current per-game value used by the live website
+    display (e.g. 43', 46', 63') and is therefore the best cheap answer to
+    "where is this match now?".  Historical detail rows can have missing or
+    1970 timestamps and must not override this live-position value.
+    """
     if not isinstance(event, dict):
         return None
     try:
         value = event.get('elapsedRegularTime')
         if value not in [None, '']:
-            values.append(float(value))
+            return float(value)
     except Exception:
         pass
-    for detail in event.get('updateDetails', []) or []:
+    return None
+
+
+def eventElapsedMinutes(event):
+    """Return current minute, preferring the top-level website value.
+
+    Detail-level elapsed/matchTime is only a fallback for payloads/restored state
+    that do not contain the bulk elapsedRegularTime field.  Do not take the max
+    of historical detail rows when a current top-level minute is available.
+    """
+    bulk = bulkElapsedMinutes(event)
+    if bulk is not None:
+        return bulk
+    values = []
+    if not isinstance(event, dict):
+        return None
+    for detail in _safeDetails(event.get('updateDetails')):
         try:
             value = detail.get('elapsedRegularTime')
             if value in [None, '']:
@@ -685,12 +874,168 @@ def eventElapsedMinutes(event):
 
 
 def snapshotIsKosher(snapshot, history=None):
+    """Legacy quality check used outside the KO/HT raw recorder path."""
     if snapshot is None or not collection.book_is_plausible(snapshot.get('back', [])):
         return False
     history = history or []
     if not collection.recent_clean(history):
         return True
     return collection.snapshot_is_strong(snapshot, history)
+
+
+def _realBackCount(snapshot):
+    if not isinstance(snapshot, dict):
+        return 0
+    prices = list(snapshot.get('back', []))
+    return sum(1 for value in prices[:3]
+               if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 1.0)
+
+
+def _completeRealBack(snapshot):
+    return _realBackCount(snapshot) == 3 and len(list(snapshot.get('back', []))) >= 3
+
+
+def _snapshotBook(snapshot):
+    if not _completeRealBack(snapshot):
+        return None
+    value = collection.book_sum(list(snapshot.get('back', []))[:3])
+    if value is not None:
+        snapshot['book'] = value
+    return value
+
+
+def _bookDistanceToAcceptable(book):
+    if book is None:
+        return float('inf')
+    if ODDS_BOOK_LOW <= book <= ODDS_BOOK_HIGH:
+        return 0.0
+    return min(abs(book - ODDS_BOOK_LOW), abs(book - ODDS_BOOK_HIGH))
+
+
+def _snapshotAcceptable(snapshot):
+    if not _completeRealBack(snapshot):
+        return False
+    status = str(snapshot.get('status') or '').upper()
+    if status in {'SUSPENDED', 'CLOSED'}:
+        return False
+    book = _snapshotBook(snapshot)
+    return book is not None and ODDS_BOOK_LOW <= book <= ODDS_BOOK_HIGH
+
+
+def _snapshotQualityKey(snapshot):
+    """Higher is better. Complete real triplets always beat partial ones.
+
+    Acceptability is only a stop condition. Outside the accepted band, the best
+    observation is the one closest to the nearest band edge. Inside the band,
+    closeness to the 1.03 target breaks ties for pre-boundary insurance.
+    """
+    if not isinstance(snapshot, dict):
+        return (-1, float('-inf'), float('-inf'), float('-inf'))
+    count = _realBackCount(snapshot)
+    when = float(snapshot.get('time') or 0)
+    if count == 3:
+        book = _snapshotBook(snapshot)
+        band_distance = _bookDistanceToAcceptable(book)
+        target_distance = abs(book - ODDS_BOOK_TARGET) if book is not None else float('inf')
+        return (3, -band_distance, -target_distance, when)
+    return (count, float('-inf'), float('-inf'), when)
+
+
+def _betterRealSnapshot(current, candidate):
+    if not isinstance(candidate, dict) or _realBackCount(candidate) == 0:
+        return current
+    if not isinstance(current, dict):
+        return copy.deepcopy(candidate)
+    return copy.deepcopy(candidate) if _snapshotQualityKey(candidate) > _snapshotQualityKey(current) else current
+
+
+def _rawBoundaryResult(snapshot, method='RAW'):
+    if not isinstance(snapshot, dict):
+        return None
+    back = list(snapshot.get('back', []))[:3]
+    while len(back) < 3:
+        back.append(None)
+    lay = list(snapshot.get('lay', []))[:3]
+    while len(lay) < 3:
+        lay.append(None)
+    selected = copy.deepcopy(snapshot)
+    selected['back'] = back
+    selected['lay'] = lay
+    selected['book'] = _snapshotBook(selected)
+    return {
+        'back': back,
+        'lay': lay,
+        'book': selected.get('book'),
+        'method': method,
+        'raw': copy.deepcopy(snapshot),
+        'selected': selected,
+        'inferred': []
+    }
+
+
+def _outputTriplet(prices):
+    """Convert raw BACK prices to output values without altering raw evidence.
+
+    Narrow sparse-market exception: when exactly two of the three Match Odds
+    BACK prices are genuinely present (>1.0), export the single missing runner
+    as 1.01 rather than 0.0.  This is only a recorder placeholder for the
+    near-certain outcome case; it is never applied when zero, one, or all three
+    real BACK prices are present.
+
+    Returns (values, inferred) so the forensic evidence can explicitly record
+    that 1.01 was not an observed BACK price.
+    """
+    values = list(prices or [])[:3]
+    while len(values) < 3:
+        values.append(None)
+
+    result = []
+    present = []
+    for index, value in enumerate(values):
+        try:
+            value = float(value)
+            valid = value > 1.0
+        except Exception:
+            valid = False
+            value = 0.0
+        result.append(value if valid else 0.0)
+        if valid:
+            present.append(index)
+
+    inferred = []
+    if len(present) == 2:
+        missing_index = next(index for index in range(3) if index not in present)
+        result[missing_index] = 1.01
+        inferred.append({
+            'runner_index': missing_index,
+            'value': 1.01,
+            'reason': 'single_missing_back_placeholder'
+        })
+
+    return result, inferred
+
+
+def pollBoundaryEntriesRaw(entries, point='RAW'):
+    """Poll KO/HT markets without repairing, mixing or synthesising BACK odds."""
+    by_market = {getMarketID(entry): entry for entry in entries if getMarketID(entry)}
+    if not by_market:
+        return {}
+    marketbook = getCleanExchangePricesfromWebsite(list(by_market.keys()))
+    results = {}
+    for market_id, entry in by_market.items():
+        snapshot = extractSnapshot(entry, marketbook)
+        if snapshot is not None:
+            addPriceHistory(entry, snapshot)
+            results[market_id] = _rawBoundaryResult(snapshot, 'RAW')
+            results[market_id]['current_raw'] = snapshot
+            results[market_id]['source_problem'] = False
+        else:
+            results[market_id] = {
+                'back': [None, None, None], 'lay': [None, None, None], 'book': None,
+                'method': 'MISS', 'raw': None, 'selected': None, 'inferred': [],
+                'current_raw': None, 'source_problem': ENDPOINT_LAST_ERROR.get('price') is not None
+            }
+    return results
 
 
 def collectorStamp():
@@ -720,41 +1065,68 @@ def entryAlreadyFinalized(entry):
 
 
 def ensureKOState(team, start, source, phase='RECOVERY'):
+    """Create/update KO recovery state only when meaningful state changed.
+
+    The old implementation refreshed an ``observed_at`` value every ordinary
+    cycle, which made live_state.json look changed even when nothing important
+    had happened.  Boundary/fallback state is persisted; heartbeat noise is not.
+    """
     if team is None or start is None:
         return
     event_id = getEventID(team)
     market_id = getMarketID(team)
+    changed = False
     if event_id not in FIRST_HALF_START_TIMES:
         FIRST_HALF_START_TIMES[event_id] = start
         FIRST_HALF_START_SOURCE[event_id] = source
-    state = KO_CAPTURE_STATE.get(market_id, {})
+        changed = True
+
+    state = KO_CAPTURE_STATE.get(market_id)
+    if not isinstance(state, dict):
+        state = {}
     if state.get('phase') not in ['FROZEN', 'MISSING']:
         actual_start = FIRST_HALF_START_TIMES.get(event_id, start)
-        state.update({
+        desired = {
             'event_id': event_id,
             'start': actual_start,
             'source': FIRST_HALF_START_SOURCE.get(event_id, source),
             'phase': phase,
             'deadline': actual_start + KO_BOUNDARY_RECONCILE_SECONDS,
-            'observed_at': time.time()
-        })
+        }
+        for key, value in desired.items():
+            if state.get(key) != value:
+                state[key] = value
+                changed = True
+        if 'observed_at' not in state:
+            state['observed_at'] = time.time()
+            changed = True
         KO_CAPTURE_STATE[market_id] = state
-    markStateDirty()
-
+    if changed:
+        markStateDirty()
 
 def observedKickoffTime(event, now_epoch=None):
-    now_epoch = now_epoch or time.time()
-    exact = transitionTime(event, 'KickOff')
-    if exact is not None:
-        return exact, 'explicit_time'
-    elapsed = eventElapsedMinutes(event)
-    if hasTransition(event, 'KickOff') and elapsed is not None and 0 <= elapsed <= KO_LIVE_ELAPSED_MAX_MINUTES:
-        return now_epoch - (elapsed * 60), 'explicit_observed'
-    status = event.get('inPlayMatchStatus', '') if isinstance(event, dict) else ''
-    if status == 'KickOff' and (elapsed is None or elapsed <= KO_LIVE_ELAPSED_MAX_MINUTES):
-        return now_epoch - ((elapsed or 0) * 60), 'status_observed'
-    return None, None
+    """Identify the KO boundary from the website timeline.
 
+    Prefer a sane KickOff updateTime.  Otherwise estimate from the displayed
+    live minute, and finally fall back to the instant we observe the KickOff
+    status.  Scheduled KO is never substituted for an actually delayed KO.
+    """
+    now_epoch = now_epoch or time.time()
+    event = _safeDict(event)
+
+    exact = transitionTime(event, 'KickOff')
+    if exact is not None and exact <= now_epoch + 60:
+        return exact, 'explicit_time'
+
+    elapsed = eventElapsedMinutes(event)
+    started = hasTransition(event, 'KickOff') or event.get('inPlayMatchStatus') in {
+        'KickOff', 'FirstHalfEnd', 'SecondHalfKickOff', 'Finished'
+    }
+    if started and elapsed is not None and elapsed >= 0:
+        return now_epoch - (elapsed * 60), 'website_elapsed'
+    if event.get('inPlayMatchStatus') == 'KickOff':
+        return now_epoch, 'website_status'
+    return None, None
 
 def koStartSourceReliable(source):
     return bool(source) and source not in KO_SYNTHETIC_START_SOURCES
@@ -899,8 +1271,32 @@ def logIssue(entry, key, point='', detail=''):
     print(f"{at_utc},{match_date},{home},{away},{code},{point},{detail}")
 
 
+def _safeDict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _safeDetails(value):
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def normaliseTimelineEvent(event):
+    """Keep external/restored timeline payloads structurally safe."""
+    if not isinstance(event, dict):
+        return {}
+    result = copy.deepcopy(event)
+    score = _safeDict(result.get('score'))
+    score['home'] = _safeDict(score.get('home'))
+    score['away'] = _safeDict(score.get('away'))
+    result['score'] = score
+    result['updateDetails'] = _safeDetails(result.get('updateDetails'))
+    return result
+
+
 def transitionDetail(event_details, event_type):
-    for detail in event_details.get('updateDetails', []):
+    event_details = _safeDict(event_details)
+    for detail in _safeDetails(event_details.get('updateDetails')):
         if detail.get('updateType') == event_type or detail.get('type') == event_type:
             return detail
     return None
@@ -917,6 +1313,7 @@ def transitionTime(event_details, event_type):
 
 
 def hasTransition(event_details, event_type):
+    event_details = _safeDict(event_details)
     if event_details.get('inPlayMatchStatus') == event_type:
         return True
     return transitionDetail(event_details, event_type) is not None
@@ -932,9 +1329,9 @@ def _scoreValue(value):
 
 
 def explicitHalfTimeScore(event):
-    score = event.get('score', {}) if isinstance(event, dict) else {}
-    home = _scoreValue(score.get('home', {}).get('halfTimeScore'))
-    away = _scoreValue(score.get('away', {}).get('halfTimeScore'))
+    score = _safeDict(event.get('score')) if isinstance(event, dict) else {}
+    home = _scoreValue(_safeDict(score.get('home')).get('halfTimeScore'))
+    away = _scoreValue(_safeDict(score.get('away')).get('halfTimeScore'))
     if home is not None and away is not None:
         return [home, away]
     return None
@@ -944,7 +1341,7 @@ def reconstructHalfTimeScore(event):
     home = 0
     away = 0
     boundary_seen = False
-    for detail in event.get('updateDetails', []):
+    for detail in _safeDetails(_safeDict(event).get('updateDetails')):
         event_type = detail.get('updateType') or detail.get('type')
         if event_type in ['FirstHalfEnd', 'SecondHalfKickOff']:
             boundary_seen = True
@@ -967,9 +1364,9 @@ def reconstructHalfTimeScore(event):
 
 
 def currentScore(event):
-    score = event.get('score', {}) if isinstance(event, dict) else {}
-    home = _scoreValue(score.get('home', {}).get('score'))
-    away = _scoreValue(score.get('away', {}).get('score'))
+    score = _safeDict(event.get('score')) if isinstance(event, dict) else {}
+    home = _scoreValue(_safeDict(score.get('home')).get('score'))
+    away = _scoreValue(_safeDict(score.get('away')).get('score'))
     if home is not None and away is not None:
         return [home, away]
     return None
@@ -1073,13 +1470,13 @@ def compactHistorySnapshot(snapshot):
 
 
 def addPriceHistory(entry, snapshot):
+    """Keep short forensic history in RAM without forcing a disk checkpoint."""
     if snapshot is None:
         return
     market_id = getMarketID(entry)
     record = compactHistorySnapshot(snapshot)
     PRICE_HISTORY.setdefault(market_id, []).append(record)
     PRICE_HISTORY[market_id] = PRICE_HISTORY[market_id][-30:]
-    markStateDirty()
 
 
 def referencePriceHistory(market_id):
@@ -1157,7 +1554,7 @@ def updateTeamExchange(team, snapshot):
             runner['exchange'] = copy.deepcopy(exchange)
 
 
-def pollEntries(entries, aggressive=False, point='', allow_history_fallback=True):
+def pollEntries(entries, point='', allow_history_fallback=True):
     entries_by_market = {}
     for entry in entries:
         market_id = getMarketID(entry)
@@ -1184,24 +1581,6 @@ def pollEntries(entries, aggressive=False, point='', allow_history_fallback=True
     source_problem = len(entries_by_market) >= 2 and len(bad) / len(entries_by_market) >= 0.75
     if source_problem:
         print(f"Website source problem: {len(bad)}/{len(entries_by_market)} focused markets returned bad data")
-    if aggressive and bad and not source_problem:
-        for _ in range(RECOVERY_RETRIES):
-            if not bad:
-                break
-            time.sleep(RECOVERY_WAIT)
-            retry_entries = [entries_by_market[market_id] for market_id in bad]
-            retry_book = getCleanExchangePricesfromWebsite(bad)
-            still_bad = []
-            for entry in retry_entries:
-                market_id = getMarketID(entry)
-                snapshot = extractSnapshot(entry, retry_book)
-                if snapshot is not None:
-                    candidates[market_id].append(snapshot)
-                    addPriceHistory(entry, snapshot)
-                    addCleanPriceHistory(entry, snapshot, history_before[market_id])
-                if snapshot is None or not snapshotIsKosher(snapshot, history_before[market_id]):
-                    still_bad.append(market_id)
-            bad = still_bad
 
     results = {}
     for market_id, entry in entries_by_market.items():
@@ -1260,7 +1639,7 @@ def pollEntries(entries, aggressive=False, point='', allow_history_fallback=True
                 'raw': current_raw, 'selected': current_raw, 'inferred': [],
                 'current_raw': current_raw, 'source_problem': source_problem
             }
-            if not source_problem and (aggressive or market_id in initial_bad):
+            if not source_problem and market_id in initial_bad:
                 logIssue(entry, 'missing_price', point, '')
             continue
 
@@ -1309,6 +1688,59 @@ def pollEntries(entries, aggressive=False, point='', allow_history_fallback=True
     return results
 
 
+def _usableBoundarySnapshot(result):
+    """Return the fresh raw snapshot, even when its overround is poor."""
+    if not isinstance(result, dict):
+        return None
+    for key in ['current_raw', 'selected', 'raw']:
+        snapshot = result.get(key)
+        if isinstance(snapshot, dict) and _realBackCount(snapshot) > 0:
+            return snapshot
+    return None
+
+def _priceResultCorrupt(result):
+    """Recovery-worthy means no acceptable complete real triplet was observed."""
+    snapshot = _usableBoundarySnapshot(result)
+    return not _snapshotAcceptable(snapshot)
+
+def _refreshRecoveryTimelines(entries):
+    event_ids = [getEventID(entry) for entry in entries if getEventID(entry)]
+    if not event_ids:
+        return []
+    timelines = requestTrackedTimelines(event_ids)
+    if timelines:
+        live_signals = detectLivePhaseSignals(timelines)
+        rememberTimelineStates(timelines, live_signals)
+        processFinished(timelines)
+        processKOEvents(timelines)
+    return timelines
+
+
+def recoverCorruptPriceResults(entries, results, point='RECOVERY'):
+    """Deprecated compatibility helper: one immediate batched retry, never sleep.
+
+    KO/HT use the shared recovery scheduler. Keeping this helper non-blocking
+    prevents a future caller from accidentally starving all other matches.
+    """
+    pending = [entry for entry in entries
+               if getMarketID(entry) and _priceResultCorrupt(results.get(getMarketID(entry)))]
+    if not pending:
+        return results
+    retry = pollBoundaryEntriesRaw(pending, point=point)
+    for entry in pending:
+        market_id = getMarketID(entry)
+        old = _usableBoundarySnapshot(results.get(market_id))
+        new = _usableBoundarySnapshot(retry.get(market_id))
+        chosen = _betterRealSnapshot(old, new)
+        if isinstance(chosen, dict):
+            results[market_id] = _rawBoundaryResult(chosen, 'RAW_BEST')
+            results[market_id]['current_raw'] = chosen
+            results[market_id]['source_problem'] = False
+        elif market_id in retry:
+            results[market_id] = retry[market_id]
+    return results
+
+
 def _compactSnapshotForState(snapshot):
     if not isinstance(snapshot, dict):
         return None
@@ -1325,6 +1757,13 @@ def _compactSnapshotForState(snapshot):
     if snapshot.get('response_time') is not None:
         result['rs'] = snapshot.get('response_time')
     return result
+
+
+def _compactHTCaptureState(event_id):
+    state = copy.deepcopy(HT_CAPTURE_STATE.get(event_id, {}) or {})
+    if isinstance(state.get('post'), dict):
+        state['post'] = _compactSnapshotForState(state.get('post'))
+    return state
 
 
 def _expandSnapshotFromState(snapshot, event_id='', market_id=''):
@@ -1345,11 +1784,12 @@ def _expandSnapshotFromState(snapshot, event_id='', market_id=''):
 
 
 def _compactTimelineForState(event):
-    if not isinstance(event, dict):
+    event = normaliseTimelineEvent(event)
+    if not event:
         return {}
-    score = event.get('score', {}) or {}
-    home = score.get('home', {}) or {}
-    away = score.get('away', {}) or {}
+    score = _safeDict(event.get('score'))
+    home = _safeDict(score.get('home'))
+    away = _safeDict(score.get('away'))
     events = []
     code_map = {
         'KickOff': 'K',
@@ -1357,7 +1797,10 @@ def _compactTimelineForState(event):
         'SecondHalfKickOff': 'S',
         'Finished': 'E',
         'SecondHalfEnd': 'E',
-        'Goal': 'G'
+        'Goal': 'G',
+        'RedCard': 'R',
+        'SendingOff': 'R',
+        'Dismissal': 'R'
     }
     for item in event.get('updateDetails', []) or []:
         kind = item.get('updateType') or item.get('type')
@@ -1383,11 +1826,12 @@ def _compactTimelineForState(event):
 
 
 def _expandTimelineFromState(record):
-    timeline = record.get('tl', {}) if isinstance(record, dict) else {}
-    score_values = list(timeline.get('sc', [])) + [''] * 6
+    timeline = _safeDict(record.get('tl')) if isinstance(record, dict) else {}
+    packed_scores = timeline.get('sc', [])
+    score_values = list(packed_scores) + [''] * 6 if isinstance(packed_scores, (list, tuple)) else [''] * 6
     home_name = record.get('h', '')
     away_name = record.get('a', '')
-    reverse_map = {'K': 'KickOff', 'F': 'FirstHalfEnd', 'S': 'SecondHalfKickOff', 'E': 'Finished', 'G': 'Goal'}
+    reverse_map = {'K': 'KickOff', 'F': 'FirstHalfEnd', 'S': 'SecondHalfKickOff', 'E': 'Finished', 'G': 'Goal', 'R': 'RedCard'}
     details = []
     for packed in timeline.get('ev', []) or []:
         if not isinstance(packed, list) or not packed:
@@ -1502,6 +1946,7 @@ def matchRecordFromTeam(team, archive_reason=None):
         'rt': {
             'ko': copy.deepcopy(KO_CAPTURE_STATE.get(market_id, {})),
             'hr': _compactSnapshotForState(HT_RECESS_STATE.get(event_id)),
+            'ht': _compactHTCaptureState(event_id),
             'hla': HT_REPLENISH_LAST_ATTEMPT.get(event_id),
             'fr': copy.deepcopy(FINAL_RECOVERY_STATE.get(event_id))
         }
@@ -1620,10 +2065,18 @@ def _restoreMatchRecord(record):
         TIMELINE_MISSING.add(event_id)
     runtime = record.get('rt', {}) or {}
     if isinstance(runtime.get('ko'), dict) and runtime.get('ko'):
-        KO_CAPTURE_STATE[market_id] = copy.deepcopy(runtime.get('ko'))
+        restored_ko = copy.deepcopy(runtime.get('ko'))
+        restored_ko.pop('pre_retry_due', None)
+        KO_CAPTURE_STATE[market_id] = restored_ko
     restored_recess = _expandSnapshotFromState(runtime.get('hr'), event_id, market_id)
     if restored_recess is not None:
         HT_RECESS_STATE[event_id] = restored_recess
+    if isinstance(runtime.get('ht'), dict) and runtime.get('ht'):
+        restored_ht = copy.deepcopy(runtime.get('ht'))
+        restored_ht.pop('pre_retry_due', None)
+        if isinstance(restored_ht.get('post'), dict):
+            restored_ht['post'] = _expandSnapshotFromState(restored_ht.get('post'), event_id, market_id)
+        HT_CAPTURE_STATE[event_id] = restored_ht
     if runtime.get('hla') is not None:
         HT_REPLENISH_LAST_ATTEMPT[event_id] = runtime.get('hla')
     if isinstance(runtime.get('fr'), dict) and runtime.get('fr'):
@@ -1643,31 +2096,40 @@ def _liveStatePayload():
     return {'v': LIVE_STATE_SCHEMA, 'matches': records}
 
 
-def saveLiveState(force=False):
+def saveLiveState(force=False, sync_backup=False):
     global STATE_DIRTY, LAST_SAVED_STATE_HASH, LIVE_STATE_RESTORED_FROM_BACKUP
-    if not force and not STATE_DIRTY:
+    if not force and not STATE_DIRTY and not sync_backup:
         return False
     payload = _liveStatePayload()
     current_hash = state_store.state_hash(payload)
     if (LAST_SAVED_STATE_HASH == current_hash and os.path.isfile(LIVE_STATE_FILE)
-            and not LIVE_STATE_RESTORED_FROM_BACKUP):
+            and not LIVE_STATE_RESTORED_FROM_BACKUP and not sync_backup):
         STATE_DIRTY = False
         return False
 
-    # If the main file was unreadable and state came from .bak, do not rotate the
-    # unreadable main file over the good backup. Rebuild live_state.json in place
-    # and keep the known-good .bak until the next normal state change.
-    keep_backup = not LIVE_STATE_RESTORED_FROM_BACKUP
-    LAST_SAVED_STATE_HASH = state_store.atomic_write_json(
-        payload, LIVE_STATE_FILE, backup=keep_backup
-    )
+    if sync_backup:
+        # Day-close housekeeping must leave both live-state files on the same
+        # current-day-only snapshot. Never rotate stale previous-day matches
+        # into the backup while closing an old day.
+        LAST_SAVED_STATE_HASH = state_store.atomic_write_json(
+            payload, LIVE_STATE_FILE, backup=False
+        )
+        state_store.atomic_write_json(payload, LIVE_STATE_FILE + '.bak', backup=False)
+    else:
+        # If the main file was unreadable and state came from .bak, do not rotate
+        # the unreadable main file over the good backup.
+        keep_backup = not LIVE_STATE_RESTORED_FROM_BACKUP
+        LAST_SAVED_STATE_HASH = state_store.atomic_write_json(
+            payload, LIVE_STATE_FILE, backup=keep_backup
+        )
+
     LIVE_STATE_RESTORED_FROM_BACKUP = False
     STATE_DIRTY = False
     return True
 
 
-def persistState(force=False):
-    return saveLiveState(force=force)
+def persistState(force=False, sync_backup=False):
+    return saveLiveState(force=force, sync_backup=sync_backup)
 
 
 def _restoreDict(target, data):
@@ -1851,16 +2313,14 @@ def _loadLegacyActiveState():
 
 
 def restoreState():
-    if _loadNewLiveState():
-        persistState(force=True)
-        return True
-    if _loadLegacyActiveState():
-        migrateLegacyDumpFiles()
-        persistState(force=True)
-        return True
+    restored = _loadNewLiveState()
+    if not restored:
+        restored = _loadLegacyActiveState()
+    # Always normalise existing dumps, even when live_state.json restored
+    # successfully. This is what catches an old dump containing several days.
     migrateLegacyDumpFiles()
     persistState(force=True)
-    return False
+    return restored
 
 
 def _resultKey(output):
@@ -1892,6 +2352,7 @@ def requestTrackedTimelines(event_ids):
         result = requestEventTimelines(batch)
         if isinstance(result, list):
             for item in result:
+                item = normaliseTimelineEvent(item)
                 event_id = collection.normalise_id(item.get('eventId'))
                 if event_id:
                     by_event[event_id] = item
@@ -1906,6 +2367,7 @@ def requestTrackedTimelines(event_ids):
                 retry = requestEventTimelines(retry_batch, force=True)
                 if isinstance(retry, list):
                     for item in retry:
+                        item = normaliseTimelineEvent(item)
                         event_id = collection.normalise_id(item.get('eventId'))
                         if event_id:
                             by_event[event_id] = item
@@ -1913,17 +2375,37 @@ def requestTrackedTimelines(event_ids):
 
 
 def watchedEventIDs(current_catalogue=None, near_start_catalogue=None):
-    event_ids = set()
-    for entry in current_catalogue or []:
-        if getEventID(entry) and not entryAlreadyFinalized(entry):
-            event_ids.add(getEventID(entry))
-    for entry in near_start_catalogue or []:
-        if getEventID(entry) and not entryAlreadyFinalized(entry):
-            event_ids.add(getEventID(entry))
-    event_ids.update(event_id for event_id in NEAR_START_CATALOGUE if event_id)
-    event_ids.update(getEventID(team) for team in DA_TEAMS if getEventID(team))
-    return sorted(event_ids)
+    """Events worth asking the website timeline service about this cycle.
 
+    Before KO, Betfair's successful catalogue/near-start lists decide relevance;
+    we do not keep hammering an unresolved fixture merely because its scheduled
+    KO was hours ago.  Once a match has genuinely started, its tracked state is
+    kept until finalisation so HT/FT collection cannot be lost if the catalogue
+    drops it near the end.
+    """
+    event_ids = set()
+    fresh_ids = set()
+    for entry in current_catalogue or []:
+        event_id = getEventID(entry)
+        if event_id and not entryAlreadyFinalized(entry):
+            event_ids.add(event_id)
+            fresh_ids.add(event_id)
+    for entry in near_start_catalogue or []:
+        event_id = getEventID(entry)
+        if event_id and not entryAlreadyFinalized(entry):
+            event_ids.add(event_id)
+            fresh_ids.add(event_id)
+
+    for team in DA_TEAMS:
+        event_id = getEventID(team)
+        if not event_id:
+            continue
+        timeline = _safeDict(LATEST_TIMELINES.get(event_id))
+        started = event_id in FIRST_HALF_START_TIMES or matchHasStarted(timeline)
+        if started or event_id in fresh_ids:
+            event_ids.add(event_id)
+
+    return sorted(event_ids)
 
 def updatePresence(current_catalogue, near_start_catalogue, timelines):
     fresh_catalogue_ids = {getEventID(entry) for entry in current_catalogue + near_start_catalogue if getEventID(entry)}
@@ -1976,69 +2458,199 @@ def _detailIdentity(detail):
     )
 
 
+def _freshObservedSecondHalfStatus(previous, previous_status, current_status, bulk_minute):
+    """Whether a no-timestamp SHKO status edge is safe to treat as fresh HT.
+
+    Betfair can omit FirstHalfEnd and can attach a literal 1970 timestamp to a
+    genuine SecondHalfKickOff.  The live website still exposes a top-level
+    elapsedRegularTime, so use that as the primary freshness gate.  Per the
+    capture policy, only minute 45 or 46 is fresh enough to *start* HT capture;
+    47+ is too late.  If the bulk minute is absent, an immediately preceding
+    FirstHalfEnd remains the only safe fallback.
+    """
+    if current_status != 'SecondHalfKickOff' or current_status == previous_status:
+        return False
+    try:
+        if bulk_minute is not None:
+            minute = float(bulk_minute)
+            return SHKO_FRESH_MINUTE_MIN <= minute <= SHKO_FRESH_MINUTE_MAX
+    except Exception:
+        pass
+    return previous_status == 'FirstHalfEnd'
+
+def _isLiteral1970UpdateTime(value):
+    """Betfair occasionally emits 1970-01-01 as a missing timestamp sentinel."""
+    return isinstance(value, str) and value.strip().startswith('1970-01-01')
+
+
+def _bulkMinuteMovedForward(previous, current):
+    """True when the per-game website minute has newly advanced."""
+    if current is None:
+        return False
+    if previous is None:
+        return True
+    try:
+        return float(current) > float(previous)
+    except Exception:
+        return False
+
+
 def detectLivePhaseSignals(timelines):
+    """Detect KO/FHE/SHKO using live website position plus transition details.
+
+    The top-level elapsedRegularTime is checked for every game first because it
+    is Betfair's current website minute.  A valid transition updateTime gives a
+    more precise boundary epoch when available; a literal 1970-01-01 timestamp
+    is treated as missing, not as evidence that the transition did not happen.
+
+    New SHKO capture is intentionally restricted to bulk minute 45/46.  A valid
+    SHKO caught earlier can continue its existing recovery into later minutes,
+    but a collector that first notices the match at minute 47+ must use PRE
+    insurance rather than relabel current prices as HT.
+    """
     now_epoch = time.time()
     phases = {'KickOff', 'FirstHalfEnd', 'SecondHalfKickOff'}
     signals = {}
+
     for event in timelines:
+        event = normaliseTimelineEvent(event)
         event_id = collection.normalise_id(event.get('eventId'))
-        previous = LATEST_TIMELINES.get(event_id, {})
+        previous = _safeDict(LATEST_TIMELINES.get(event_id))
         previous_status = previous.get('inPlayMatchStatus')
         current_status = event.get('inPlayMatchStatus')
-        minute = eventElapsedMinutes(event)
+        previous_bulk_minute = bulkElapsedMinutes(previous)
+        bulk_minute = bulkElapsedMinutes(event)
+        minute = bulk_minute if bulk_minute is not None else eventElapsedMinutes(event)
         event_signals = {}
 
-        if current_status in phases and current_status != previous_status:
-            live = False
-            if current_status == 'KickOff':
-                live = minute is None or minute <= KO_LIVE_ELAPSED_MAX_MINUTES
-            elif current_status == 'FirstHalfEnd':
-                live = True
-            elif current_status == 'SecondHalfKickOff':
-                live = minute is not None and HT_SIGNAL_MINUTE_MIN <= minute <= HT_SIGNAL_MINUTE_MAX
-            if live:
-                event_signals[current_status] = {
-                    'source': 'STATUS', 'observed_at': now_epoch, 'bf_minute': minute
-                }
-
-        previous_details = {_detailIdentity(item) for item in previous.get('updateDetails', []) or []}
-        for detail in event.get('updateDetails', []) or []:
+        previous_details = {_detailIdentity(item) for item in _safeDetails(previous.get('updateDetails'))}
+        for detail in _safeDetails(event.get('updateDetails')):
             phase = detail.get('updateType') or detail.get('type')
             if phase not in phases or _detailIdentity(detail) in previous_details:
                 continue
-            exact = parseBetfairTimestamp(detail.get('updateTime'))
-            if exact is not None and exact <= 86400:
-                exact = None
-            recent = exact is not None and 0 <= now_epoch - exact <= HT_SIGNAL_FRESH_SECONDS
-            live = recent
-            if exact is None:
-                if phase == 'KickOff':
-                    live = minute is None or minute <= KO_LIVE_ELAPSED_MAX_MINUTES
-                elif phase == 'FirstHalfEnd':
-                    live = current_status == 'FirstHalfEnd'
-                elif phase == 'SecondHalfKickOff':
-                    live = minute is not None and HT_SIGNAL_MINUTE_MIN <= minute <= HT_SIGNAL_MINUTE_MAX
+
+            raw_update_time = detail.get('updateTime')
+            exact = None if _isLiteral1970UpdateTime(raw_update_time) else parseBetfairTimestamp(raw_update_time)
+
+            if exact is not None:
+                # A real timestamp is retained even if discovered later; the
+                # recovery layer decides whether its +90s window is still open.
+                # For SHKO, however, first discovery at bulk minute 47+ is
+                # intentionally too late to start a new HT capture.
+                shko_minute_ok = True
+                if phase == 'SecondHalfKickOff' and bulk_minute is not None:
+                    shko_minute_ok = SHKO_FRESH_MINUTE_MIN <= float(bulk_minute) <= SHKO_FRESH_MINUTE_MAX
+                if shko_minute_ok:
+                    event_signals[phase] = {
+                        'source': 'UPDATE_DETAIL',
+                        'observed_at': now_epoch,
+                        'bf_minute': minute,
+                        'detail_time': exact,
+                        'stale': phase in {'KickOff', 'SecondHalfKickOff'}
+                                 and now_epoch - exact > BOUNDARY_RECOVERY_SECONDS,
+                    }
+                continue
+
+            # Missing/1970 timestamp: the transition may still be genuine.  Use
+            # current website state and, crucially, the bulk live minute rather
+            # than requiring the broken timestamp.
+            live = False
+            if phase == 'KickOff':
+                live = (current_status == 'KickOff' and current_status != previous_status
+                        and (bulk_minute is None or bulk_minute <= 2))
+            elif phase == 'FirstHalfEnd':
+                live = current_status == 'FirstHalfEnd'
+            elif phase == 'SecondHalfKickOff':
+                live = _freshObservedSecondHalfStatus(
+                    previous, previous_status, current_status, bulk_minute)
+
             if live and phase not in event_signals:
                 event_signals[phase] = {
-                    'source': 'UPDATE_DETAIL', 'observed_at': now_epoch, 'bf_minute': minute,
-                    'detail_time': exact
+                    'source': 'STATUS', 'observed_at': now_epoch, 'bf_minute': minute,
+                    'detail_time': None, 'stale': False
+                }
+
+        # Some payloads expose only the current status and no transition detail.
+        if current_status in phases and current_status != previous_status and current_status not in event_signals:
+            live = False
+            if current_status == 'KickOff':
+                live = bulk_minute is None or bulk_minute <= 2
+            elif current_status == 'FirstHalfEnd':
+                live = True
+            elif current_status == 'SecondHalfKickOff':
+                live = _freshObservedSecondHalfStatus(
+                    previous, previous_status, current_status, bulk_minute)
+            if live:
+                event_signals[current_status] = {
+                    'source': 'STATUS', 'observed_at': now_epoch, 'bf_minute': minute,
+                    'detail_time': None, 'stale': False
+                }
+
+        # REGRESSION GUARD / independent live-position fallback: even if a
+        # transition detail/status edge is absent, a newly advanced bulk minute
+        # can tell us that the match moved.  Keep this conservative:
+        #   * minute 0/1 may establish a KO whiff;
+        #   * minute 45/46 may establish SHKO only if half-time was already
+        #     known.  Minute 46 alone is NOT enough because first-half stoppage
+        #     time can also show 46.
+        moved_forward = _bulkMinuteMovedForward(previous_bulk_minute, bulk_minute)
+        if moved_forward and bulk_minute is not None:
+            try:
+                bulk_value = float(bulk_minute)
+            except Exception:
+                bulk_value = None
+
+            if (bulk_value is not None and 0.0 <= bulk_value <= 1.0
+                    and 'KickOff' not in event_signals
+                    and event_id not in FIRST_HALF_START_TIMES
+                    and current_status not in {'FirstHalfEnd', 'SecondHalfKickOff', 'Finished'}):
+                event_signals['KickOff'] = {
+                    'source': 'BULK_ELAPSED', 'observed_at': now_epoch,
+                    'bf_minute': bulk_value, 'detail_time': None, 'stale': False
+                }
+
+            half_time_known = (
+                event_id in FIRST_HALF_END_TIMES
+                or previous_status == 'FirstHalfEnd'
+            )
+            if (bulk_value is not None
+                    and SHKO_FRESH_MINUTE_MIN <= bulk_value <= SHKO_FRESH_MINUTE_MAX
+                    and half_time_known
+                    and 'SecondHalfKickOff' not in event_signals
+                    and event_id not in SECOND_HALF_START_TIMES):
+                event_signals['SecondHalfKickOff'] = {
+                    'source': 'BULK_ELAPSED', 'observed_at': now_epoch,
+                    'bf_minute': bulk_value, 'detail_time': None, 'stale': False
                 }
 
         if event_signals:
             signals[event_id] = event_signals
     return signals
 
-
 def rememberTimelineStates(timelines, live_signals=None):
     now_epoch = time.time()
     for event in timelines:
+        event = normaliseTimelineEvent(event)
+        if not event:
+            continue
         event_id = collection.normalise_id(event.get('eventId'))
-        if LATEST_TIMELINES.get(event_id) != event:
-            LATEST_TIMELINES[event_id] = copy.deepcopy(event)
+
+        # Always keep the freshest timeline in RAM, including Betfair's
+        # top-level elapsedRegularTime.  That bulk field is the live website
+        # minute and is deliberately used by detectLivePhaseSignals even when a
+        # transition detail is missing or carries the 1970 timestamp sentinel.
+        # Dirty the persisted state only when the compact recovery
+        # information changes (phase, score, or material/phase events).  This
+        # avoids a live_state.json write merely because 31' became 32'.
+        previous = _safeDict(LATEST_TIMELINES.get(event_id))
+        previous_persisted = _compactTimelineForState(previous) if previous else {}
+        current_persisted = _compactTimelineForState(event)
+        LATEST_TIMELINES[event_id] = copy.deepcopy(event)
+        if previous_persisted != current_persisted:
             markStateDirty()
 
         if hasTransition(event, 'KickOff'):
-            changed_boundary = reconcileTimelineKickOff(event, now_epoch)
+            reconcileTimelineKickOff(event, now_epoch)
             kickoff = FIRST_HALF_START_TIMES.get(event_id)
             source = FIRST_HALF_START_SOURCE.get(event_id)
             team = findTeamByEvent(event_id)
@@ -2046,11 +2658,13 @@ def rememberTimelineStates(timelines, live_signals=None):
                 ensureKOState(team, kickoff, source or 'timeline')
 
         if hasTransition(event, 'FirstHalfEnd') and event_id not in FIRST_HALF_END_TIMES:
-            first_end = transitionTime(event, 'FirstHalfEnd')
             signal = (live_signals or {}).get(event_id, {}).get('FirstHalfEnd')
+            first_end = signal.get('detail_time') if signal is not None else None
+            if first_end is None:
+                first_end = transitionTime(event, 'FirstHalfEnd')
             if first_end is None and signal is not None:
                 first_end = signal.get('observed_at', now_epoch)
-            elif first_end is None and event.get('inPlayMatchStatus') == 'FirstHalfEnd':
+            if first_end is None and event.get('inPlayMatchStatus') == 'FirstHalfEnd':
                 first_end = now_epoch
             if first_end is not None:
                 FIRST_HALF_END_TIMES[event_id] = first_end
@@ -2061,11 +2675,26 @@ def rememberTimelineStates(timelines, live_signals=None):
                     FIRST_HALF_END_SCORES[event_id] = score
                 markStateDirty()
 
+        # Record the observed restart *before* routine HT pre-price selection.
+        # This ensures a price fetched after the transition can never be
+        # mislabelled as a pre-restart fallback.
+        sh_signal = (live_signals or {}).get(event_id, {}).get('SecondHalfKickOff')
+        if sh_signal is not None and event_id not in SECOND_HALF_START_TIMES:
+            SECOND_HALF_START_TIMES[event_id] = (sh_signal.get('detail_time')
+                                                  or sh_signal.get('observed_at', now_epoch))
+            SECOND_HALF_START_SOURCE[event_id] = sh_signal.get('source', 'STATUS')
+            state = HT_CAPTURE_STATE.setdefault(event_id, {})
+            state['boundary_observed_at'] = SECOND_HALF_START_TIMES[event_id]
+            state['source'] = SECOND_HALF_START_SOURCE[event_id]
+            markStateDirty()
+
         team = findTeamByEvent(event_id)
         if team is not None:
-            changed = team.get('score') != event.get('score') or team.get('updateDetails') != event.get('updateDetails')
-            team['score'] = event.get('score', team.get('score', ''))
-            team['updateDetails'] = event.get('updateDetails', team.get('updateDetails', ''))
+            new_score = event.get('score', team.get('score', ''))
+            new_details = event.get('updateDetails', team.get('updateDetails', ''))
+            changed = team.get('score') != new_score or team.get('updateDetails') != new_details
+            team['score'] = new_score
+            team['updateDetails'] = new_details
             if changed:
                 markStateDirty()
 
@@ -2080,7 +2709,7 @@ def matchHasStarted(event):
             return True
     except Exception:
         pass
-    return any((detail.get('elapsedRegularTime') or detail.get('matchTime') or 0) >= 1 for detail in event.get('updateDetails', []))
+    return any((detail.get('elapsedRegularTime') or detail.get('matchTime') or 0) >= 1 for detail in _safeDetails(event.get('updateDetails')))
 
 
 def processKOEvents(timelines):
@@ -2112,7 +2741,17 @@ def processKOEvents(timelines):
             ensureKOState(team, start, source or 'timeline')
 
 def processCatalogueKickOffFallback(current_catalogue):
+    """Turn a *new* Betfair active-catalogue transition into a real KO whiff.
+
+    The API catalogue is not used for odds; it is trusted only for the fact that
+    Betfair now regards this market as active.  v0.2.11 recorded this transition
+    but then waited for the timeline before arming price recovery, which meant a
+    missing/late timeline could produce zero POST attempts.  Arm the shared POST
+    scheduler immediately here; the actual prices still come from the website
+    JSON endpoint in ``runBoundaryRecoveryTick``.
+    """
     now_epoch = time.time()
+    activated = False
     for entry in current_catalogue:
         if entryAlreadyFinalized(entry):
             continue
@@ -2129,78 +2768,41 @@ def processCatalogueKickOffFallback(current_catalogue):
             event = LATEST_TIMELINES.get(event_id, {})
             start, source = observedKickoffTime(event, now_epoch)
 
-        if start is None:
-            scheduled = scheduledStart(entry)
-            if scheduled is not None and now_epoch <= scheduled + KO_LIVE_DISCOVERY_MAX_AFTER_SCHEDULE_SECONDS:
-                start = now_epoch
-                source = 'catalogue_inplay_live'
-                logIssue(team, 'first_half_fallback', 'KO', f'catalogue_inplay_live|obs={collectorStamp()}')
-            elif scheduled is not None:
-                start = scheduled
-                source = 'catalogue_inplay_late'
+        newly_active = event_id in NEWLY_ACTIVE_CATALOGUE_IDS
+        if start is None and newly_active:
+            start = now_epoch
+            source = 'catalogue_inplay_live'
+            logIssue(team, 'first_half_fallback', 'KO', f'catalogue_active_transition|obs={collectorStamp()}')
 
         if start is not None:
             ensureKOState(team, start, source or 'catalogue_inplay')
 
-def _recoverBoundarySnapshot(team, snapshot, reference):
-    if snapshot is None:
+        # REGRESSION GUARD (2026-10-08): catalogue activation itself is enough
+        # to start T+0 POST capture.  Do not require a timeline event as well.
+        # This fixes AL Sadd U20 and gives unexpectedly early KOs (such as
+        # Slovenia U19 v Serbia U19) a chance to capture while the 90s window is
+        # still open.  ``_activateKORecovery`` is non-blocking and only schedules
+        # the website price request; it does not call the Exchange price API.
+        if newly_active and start is not None:
+            if _activateKORecovery(team, now_epoch):
+                activated = True
+    return activated
+
+def _recoverBoundarySnapshot(team, snapshot, reference=None):
+    """Return only actually observed BACK prices; never numerically repair them."""
+    result = _rawBoundaryResult(snapshot, 'RAW')
+    if result is None or _realBackCount(result.get('selected')) == 0:
         return None
-    repaired = (collection.repair_match_odds_boundary(snapshot, reference)
-                if isMatchOddsEntry(team) else collection.repair_missing_back(snapshot, reference))
-    if repaired is not None:
-        selected = copy.deepcopy(snapshot)
-        selected['back'] = list(repaired['back'])
-        selected['lay'] = list(repaired.get('lay', snapshot.get('lay', [None, None, None])))
-        selected['book'] = repaired.get('book')
-        return {
-            'back': list(repaired['back']),
-            'lay': list(repaired.get('lay', snapshot.get('lay', [None, None, None]))),
-            'book': repaired.get('book'),
-            'raw': snapshot,
-            'selected': selected,
-            'inferred': list(repaired.get('inferred', []))
-        }
-    if snapshotIsKosher(snapshot, reference):
-        return {
-            'back': list(snapshot['back']),
-            'lay': list(snapshot.get('lay', [None, None, None])),
-            'book': snapshot.get('book'),
-            'raw': snapshot,
-            'selected': copy.deepcopy(snapshot),
-            'inferred': []
-        }
-    return None
+    return result
 
-
-def _koPreCandidates(team, start, source):
+def _koPreCandidates(team, scheduled, source=None):
+    """Legacy/history fallback: only pre-KO prices at or before scheduled KO."""
     market_id = getMarketID(team)
     history = sorted(PRICE_HISTORY.get(market_id, []), key=lambda item: item.get('time', 0))
-    lower = start - KO_BACKUP_MAX_AGE_SECONDS
-    candidates = []
-    entered_play = False
-    for item in history:
-        when = item.get('time', 0) or 0
-        if when < lower or when > start + KO_BOUNDARY_RECONCILE_SECONDS:
-            continue
-        inplay = item.get('inplay')
-        if inplay is True:
-            entered_play = True
-            continue
-        if entered_play:
-            continue
-        if inplay is False:
-            candidates.append(item)
-        elif inplay is None and source not in KO_SYNTHETIC_START_SOURCES and when <= start:
-            candidates.append(item)
-    return candidates
-
-
-def _koFirstPostCandidate(team, start):
-    market_id = getMarketID(team)
-    history = sorted(PRICE_HISTORY.get(market_id, []), key=lambda item: item.get('time', 0))
-    return next((item for item in history
-                 if start <= (item.get('time', 0) or 0) <= start + KO_POST_BOUNDARY_SECONDS
-                 and item.get('inplay') is True), None)
+    lower = scheduled - KO_BACKUP_MAX_AGE_SECONDS
+    return [item for item in history
+            if lower <= (item.get('time', 0) or 0) <= scheduled
+            and item.get('inplay') is False]
 
 
 def _storedPreKOSnapshot(team):
@@ -2209,52 +2811,77 @@ def _storedPreKOSnapshot(team):
     return copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
 
 
-def _koMaterialEventBeforePost(team, post_snapshot):
-    """Return a reason only when a material event predates the post-KO snapshot."""
-    if not isinstance(post_snapshot, dict):
-        return None
-    event_id = getEventID(team)
-    if event_id in TIMELINE_MISSING:
-        return 'TIMELINE_MISSING'
+def _storedPostKOSnapshot(team):
+    state = KO_CAPTURE_STATE.get(getMarketID(team), {}) or {}
+    snapshot = state.get('post')
+    return copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
 
-    event = LATEST_TIMELINES.get(event_id, {}) or {}
-    post_time = post_snapshot.get('time') or time.time()
-    start = FIRST_HALF_START_TIMES.get(event_id)
-    untimed_material = False
 
-    for detail in event.get('updateDetails', []) or []:
-        event_type = str(detail.get('updateType') or detail.get('type') or '')
-        kind = event_type.lower().replace('_', '')
-        if kind not in {'goal', 'redcard', 'sendingoff', 'dismissal'}:
-            continue
+def _legacyFirstPostCandidate(team, scheduled):
+    """Compatibility for state made before the dedicated one-shot post slot."""
+    history = sorted(PRICE_HISTORY.get(getMarketID(team), []), key=lambda item: item.get('time', 0))
+    return next((item for item in history
+                 if (item.get('time', 0) or 0) >= scheduled
+                 and item.get('inplay') is True
+                 and collection.book_is_plausible(item.get('back', []))), None)
 
-        event_time = parseBetfairTimestamp(detail.get('updateTime'))
-        if event_time is not None and event_time <= 86400:
-            event_time = None
-        if event_time is None and start is not None:
-            try:
-                elapsed = detail.get('elapsedRegularTime')
-                if elapsed in [None, '']:
-                    elapsed = detail.get('matchTime')
-                if elapsed not in [None, '']:
-                    event_time = start + float(elapsed) * 60
-            except Exception:
-                event_time = None
 
-        if event_time is None:
-            untimed_material = True
-            continue
-        if event_time <= post_time:
-            return event_type.upper() or 'MATERIAL_EVENT'
-
-    # Only use the current score as a conservative fallback when material event
-    # timing itself is unavailable. A later goal must not invalidate a clean
-    # post-KO snapshot during restore/recovery.
-    if untimed_material:
-        score = currentScore(event)
-        if score is not None and (score[0] > 0 or score[1] > 0):
-            return f"GOAL_SCORE_{score[0]}-{score[1]}"
+def _websiteMaterialEvent(event):
+    for detail in _safeDetails(_safeDict(event).get('updateDetails')):
+        kind = str(detail.get('updateType') or detail.get('type') or '').lower().replace('_', '')
+        if kind in {'goal', 'redcard', 'sendingoff', 'dismissal'}:
+            return str(detail.get('updateType') or detail.get('type') or 'MATERIAL_EVENT').upper()
     return None
+
+
+def _koPostSafety(team, post_snapshot, scheduled, now_epoch=None):
+    """Classify the one post-KO candidate using Betfair website live state.
+
+    SAFE means the website timer/status still shows the match right at KO and no
+    goal/red card has appeared. WAIT gives the website a short chance to catch
+    up with the price feed. UNSAFE means use the locked scheduled-time pre-KO.
+    """
+    now_epoch = now_epoch or time.time()
+    if not isinstance(post_snapshot, dict):
+        return 'UNSAFE', 'NO_POST'
+
+    event_id = getEventID(team)
+    post_time = post_snapshot.get('time') or now_epoch
+    timeline_fresh = event_id not in TIMELINE_MISSING and bool(LATEST_TIMELINES.get(event_id))
+
+    if not timeline_fresh:
+        # Without the website timer, accept only a post price that arrived on the
+        # first ordinary 30-second cycle around the theoretical KO. A delayed
+        # in-play wake-up must never replace the locked pre-KO book.
+        if post_time <= scheduled + KO_POST_BOUNDARY_SECONDS:
+            return 'SAFE', 'NO_TIMELINE_NEAR_SCHEDULE'
+        return 'UNSAFE', 'NO_TIMELINE_LATE'
+
+    event = _safeDict(LATEST_TIMELINES.get(event_id))
+    material = _websiteMaterialEvent(event)
+    if material:
+        return 'UNSAFE', material
+
+    elapsed = eventElapsedMinutes(event)
+    status = str(event.get('inPlayMatchStatus') or '')
+    started = matchHasStarted(event)
+
+    if started:
+        if elapsed is not None:
+            if 0 <= elapsed <= KO_POST_WEBSITE_MAX_MINUTES:
+                return 'SAFE', f'WEB_{elapsed:g}M'
+            return 'UNSAFE', f'WEB_{elapsed:g}M_LATE'
+        # Website says live but has no usable minute. Give the status feed one
+        # short cycle to populate its timer, then fall back to pre-KO.
+        if now_epoch - post_time <= KO_POST_CONFIRM_WAIT_SECONDS:
+            return 'WAIT', 'WEB_STARTED_NO_MINUTE'
+        return 'UNSAFE', 'WEB_STARTED_NO_MINUTE_LATE'
+
+    # Price feed can flip in-play just before the website status response catches
+    # up. Preserve this first post snapshot but never replace it with a later one.
+    if now_epoch - post_time <= KO_POST_CONFIRM_WAIT_SECONDS:
+        return 'WAIT', f'WEB_NOT_STARTED_{status or "NONE"}'
+    return 'UNSAFE', 'WEB_NOT_STARTED_LATE'
 
 
 def _fmtOdds(prices):
@@ -2286,12 +2913,7 @@ def _koTripletTickMove(first, second):
 
 
 def logKOBoundaryMovement(team, pre_result, post_result):
-    """Log pre/post KO only when the boundary move is unusually large.
-
-    The baseline is the sequence of valid 30-second pre-KO triplet movements
-    collected during the final three minutes. A boundary move is logged only
-    when it is clearly above both the typical and the largest recent move.
-    """
+    """Log pre/post KO only when the boundary move is unusually large."""
     if pre_result is None or post_result is None:
         return
     pre = list(pre_result.get('back', []))
@@ -2316,66 +2938,46 @@ def logKOBoundaryMovement(team, pre_result, post_result):
              f"pre={_fmtOdds(pre)};post={_fmtOdds(post)}")
 
 
-def selectKOBoundary(team, start, now_epoch=None):
+def _koUsePreWhenPostWindowGone(team, scheduled, now_epoch=None):
+    """Return True once a future post-KO observation would be too late to trust."""
     now_epoch = now_epoch or time.time()
     event_id = getEventID(team)
-    market_id = getMarketID(team)
-    source = FIRST_HALF_START_SOURCE.get(event_id, 'unknown')
-    clean_reference = [item for item in CLEAN_PRICE_HISTORY.get(market_id, [])
-                       if (item.get('time', 0) or 0) <= start]
+    timeline_fresh = event_id not in TIMELINE_MISSING and bool(LATEST_TIMELINES.get(event_id))
+    if not timeline_fresh:
+        return now_epoch > scheduled + KO_POST_BOUNDARY_SECONDS
 
-    # The explicit saved pre-KO snapshot is authoritative as the fallback. It is
-    # collected only on the ordinary 30-second cycle during the final 3 minutes.
-    pre_result = None
-    stored_pre = _storedPreKOSnapshot(team)
-    if stored_pre is not None:
-        pre_result = _recoverBoundarySnapshot(team, stored_pre, clean_reference)
+    event = _safeDict(LATEST_TIMELINES.get(event_id))
+    if _websiteMaterialEvent(event):
+        return True
+    if not matchHasStarted(event):
+        # Genuine delayed kick-off: keep watching. The saved pre-KO book remains
+        # locked at the scheduled start and will not be replaced.
+        return False
+    elapsed = eventElapsedMinutes(event)
+    return elapsed is not None and elapsed > KO_POST_WEBSITE_MAX_MINUTES
 
-    # Compatibility with state created before the explicit pre-KO slot existed.
-    if pre_result is None:
-        for item in _koPreCandidates(team, start, source):
-            recovered = _recoverBoundarySnapshot(team, item, clean_reference)
-            if recovered is not None:
-                pre_result = recovered
-                if snapshotIsKosher(recovered['selected'], clean_reference):
-                    clean_reference.append(recovered['selected'])
 
-    post_raw = _koFirstPostCandidate(team, start)
-    post_result = _recoverBoundarySnapshot(team, post_raw, clean_reference) if post_raw is not None else None
+def selectKOBoundary(team, start=None, now_epoch=None):
+    """Select already-captured KO evidence without synthesising odds."""
+    now_epoch = now_epoch or time.time()
+    state = KO_CAPTURE_STATE.get(getMarketID(team), {}) or {}
+    pre = state.get('pre') if isinstance(state.get('pre'), dict) else None
+    post = state.get('post') if isinstance(state.get('post'), dict) else None
+    event = _safeDict(LATEST_TIMELINES.get(getEventID(team)))
+    elapsed = eventElapsedMinutes(event)
+    material = _websiteMaterialEvent(event) if event else None
 
-    # Catalogue/scheduled-time fallbacks do not define the real KO boundary.
-    # Keep collecting 30-second evidence and timeline updates until a genuine
-    # KickOff observation replaces the synthetic start.
-    if source in KO_SYNTHETIC_START_SOURCES:
-        return None, False
-
-    if pre_result is not None and post_result is not None:
-        event_reason = _koMaterialEventBeforePost(team, post_result.get('selected'))
-        if event_reason:
-            pre_result['method'] = 'BOUNDARY_PRE_EVENT'
-            return pre_result, True
-
-        # Normal case: use the first clean post-KO price even if it moved from
-        # the pre-KO market. Only unusually large boundary moves are logged.
-        logKOBoundaryMovement(team, pre_result, post_result)
-        post_result['method'] = 'BOUNDARY_POST'
-        return post_result, True
-
-    if post_result is not None:
-        # A post-kick-off price can stand alone only when the kick-off boundary
-        # came from a real timeline observation and the same cycle has no sign
-        # that a goal/red card already contaminated that first post-KO price.
-        if source not in KO_SYNTHETIC_START_SOURCES:
-            event_reason = _koMaterialEventBeforePost(team, post_result.get('selected'))
-            if event_reason is None:
-                post_result['method'] = 'BOUNDARY_POST_ONLY'
-                return post_result, True
-
-    if pre_result is not None and now_epoch >= start + KO_POST_BOUNDARY_SECONDS:
-        pre_result['method'] = 'BOUNDARY_PRE'
-        return pre_result, True
-
-    return None, now_epoch > start + KO_BOUNDARY_RECONCILE_SECONDS
+    if material and isinstance(pre, dict):
+        result = _rawBoundaryResult(pre, 'KO_PRE_MATERIAL_EVENT')
+        return result, True
+    if isinstance(post, dict):
+        result = _rawBoundaryResult(post, state.get('post_method') or 'KO_POST_BEST')
+        return result, True
+    if elapsed is not None and elapsed > KO_LIVE_ELAPSED_MAX_MINUTES:
+        if isinstance(pre, dict):
+            return _rawBoundaryResult(pre, 'KO_PRE_LATE_FALLBACK'), True
+        return None, True
+    return None, False
 
 def firstKosherKO(team, start):
     result, ready = selectKOBoundary(team, start)
@@ -2385,58 +2987,164 @@ def firstKosherKO(team, start):
     return selected, result.get('method')
 
 
-def applyPendingKO(timelines, results):
+
+def _boundaryScoreChanged(state, event):
+    baseline = state.get('boundary_score') if isinstance(state, dict) else None
+    current = currentScore(event) if isinstance(event, dict) else None
+    if baseline is None or current is None:
+        return False
+    return list(current) != list(baseline)
+
+
+def _postPollAllowed(state, now_epoch):
+    """Whether another post-boundary website price request is still allowed."""
+    if not isinstance(state, dict):
+        return False
+    count = int(state.get('post_poll_count') or 0)
+    if count >= POST_RECOVERY_TOTAL_POLLS:
+        return False
+    deadline = float(state.get('recovery_deadline') or 0)
+    if not deadline:
+        return True
+    if now_epoch <= deadline:
+        return True
+    # The scheduler may wake a fraction late for the final T+90 slot.  Permit
+    # only that already-scheduled final slot, never a genuinely late recovery.
+    retry = state.get('next_retry')
+    return (retry is not None and float(retry) <= deadline
+            and now_epoch <= deadline + BOUNDARY_FINAL_SLOT_GRACE_SECONDS)
+
+
+def _scheduleNextPostPoll(state, now_epoch):
+    count = int(state.get('post_poll_count') or 0)
+    deadline = float(state.get('recovery_deadline') or 0)
+    if count >= POST_RECOVERY_TOTAL_POLLS or (deadline and now_epoch >= deadline):
+        return False
+    due = now_epoch + RECOVERY_INTERVAL
+    if deadline:
+        due = min(due, deadline)
+    state['next_retry'] = due
+    return True
+
+
+def _activateKORecovery(team, now_epoch=None):
+    """Start/resume the shared non-blocking POST capture for KickOff."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    event_id = getEventID(team)
+    market_id = getMarketID(team)
+    state = KO_CAPTURE_STATE.setdefault(market_id, {})
+    if state.get('phase') in {'FROZEN', 'MISSING'}:
+        return False
+
+    boundary = FIRST_HALF_START_TIMES.get(event_id)
+    if boundary is None:
+        return False
+
+    changed = False
+    desired = {
+        'phase': 'POST_RECOVERY',
+        'event_id': event_id,
+        'capture_started_at': state.get('capture_started_at') or now_epoch,
+        'boundary_observed_at': boundary,
+        'source': FIRST_HALF_START_SOURCE.get(event_id, state.get('source', 'timeline')),
+        'recovery_deadline': boundary + BOUNDARY_RECOVERY_SECONDS,
+    }
+    event = _safeDict(LATEST_TIMELINES.get(event_id))
+    if state.get('boundary_score') is None:
+        desired['boundary_score'] = [0, 0]
+    if state.get('post_poll_count') is None:
+        desired['post_poll_count'] = 0
+    if state.get('next_retry') is None:
+        desired['next_retry'] = now_epoch
+
+    for key, value in desired.items():
+        if state.get(key) != value:
+            state[key] = value
+            changed = True
+    if changed:
+        markStateDirty()
+    return True
+
+def captureKOBoundaryPrice(team, initial_result=None):
+    """Compatibility wrapper: KO recovery is scheduled, never blocking."""
+    if not _activateKORecovery(team):
+        return None
+    state = KO_CAPTURE_STATE.get(getMarketID(team), {}) or {}
+    snapshot = _usableBoundarySnapshot(initial_result)
+    if isinstance(snapshot, dict):
+        current = state.get('post') if isinstance(state.get('post'), dict) else None
+        chosen = _betterRealSnapshot(current, snapshot)
+        if chosen is not current:
+            state['post'] = compactHistorySnapshot(chosen)
+            state['post_method'] = 'KO_POST_CANDIDATE'
+            markStateDirty()
+        if _snapshotAcceptable(snapshot):
+            return _rawBoundaryResult(snapshot, 'KO_POST_ACCEPTABLE')
+    return None
+
+
+def applyPendingKO(timelines, results=None):
+    """Turn a genuine KickOff into the unified non-blocking POST capture."""
+    results = results or {}
     now_epoch = time.time()
     for team in list(DA_TEAMS):
         if koIsFilled(team):
             continue
         market_id = getMarketID(team)
         event_id = getEventID(team)
-        start = FIRST_HALF_START_TIMES.get(event_id)
-        if start is None:
+        event = _safeDict(LATEST_TIMELINES.get(event_id))
+        if not event or not matchHasStarted(event):
             continue
 
-        result, ready = selectKOBoundary(team, start, now_epoch)
-        if result is not None:
-            freezeKO(team, result)
+        if not _activateKORecovery(team, now_epoch):
+            continue
+        state = KO_CAPTURE_STATE.setdefault(market_id, {})
+        if _websiteMaterialEvent(event) or _boundaryScoreChanged(state, event):
+            _finaliseKORecovery(team, reason='MATERIAL_EVENT')
             continue
 
-        if ready:
-            state = KO_CAPTURE_STATE.setdefault(market_id, {})
-            source = FIRST_HALF_START_SOURCE.get(event_id, state.get('source', 'unknown'))
-            if source in KO_SYNTHETIC_START_SOURCES:
-                state.update({'event_id': event_id, 'start': start, 'source': source,
-                              'phase': 'RECOVERY',
-                              'deadline': start + KO_BOUNDARY_RECONCILE_SECONDS})
-                KO_MISSING.discard(market_id)
-                markStateDirty()
-                continue
-            state.update({'event_id': event_id, 'start': start,
-                          'source': source, 'phase': 'MISSING',
-                          'deadline': start + KO_BOUNDARY_RECONCILE_SECONDS})
-            rememberCaptureEvidence(team, 'KO', {'method': 'MISS', 'raw': None})
-            KO_MISSING.add(market_id)
-            logIssue(team, 'late_start', 'KO', f"{state.get('source', 'unknown')}|obs={collectorStamp()}")
-            markStateDirty()
-
+        # If the ordinary 30-second pre-window request happened after KickOff in
+        # this same cycle, it is already our immediate POST attempt.  Do not make
+        # a duplicate T+0 call; schedule the first retry for +15s if necessary.
+        if market_id in results and int(state.get('post_poll_count') or 0) == 0:
+            state['post_poll_count'] = 1
+            snapshot = _usableBoundarySnapshot(results.get(market_id))
+            if isinstance(snapshot, dict):
+                current = state.get('post') if isinstance(state.get('post'), dict) else None
+                chosen = _betterRealSnapshot(current, snapshot)
+                if chosen is not current:
+                    state['post'] = compactHistorySnapshot(chosen)
+                    state['post_method'] = 'KO_POST_CANDIDATE'
+                    markStateDirty()
+                if _snapshotAcceptable(snapshot):
+                    state['phase'] = 'FROZEN'
+                    _clearRecoveryTiming(state)
+                    markStateDirty()
+                    freezeKO(team, _rawBoundaryResult(snapshot, 'KO_POST_ACCEPTABLE'))
+                    continue
+            _scheduleNextPostPoll(state, time.time())
 
 def secondHalfGoalRecorded(event):
+    return secondHalfMaterialEventRecorded(event) is not None
+
+
+def secondHalfMaterialEventRecorded(event):
     restart_seen = False
-    for detail in event.get('updateDetails', []) or []:
-        event_type = detail.get('updateType') or detail.get('type')
+    for detail in _safeDetails(_safeDict(event).get('updateDetails')):
+        event_type = str(detail.get('updateType') or detail.get('type') or '')
         if event_type == 'SecondHalfKickOff':
             restart_seen = True
             continue
-        if event_type != 'Goal':
+        normalised = event_type.lower().replace('_', '')
+        if normalised not in {'goal', 'redcard', 'sendingoff', 'dismissal'}:
             continue
         try:
             elapsed = float(detail.get('elapsedRegularTime') or detail.get('matchTime') or 0)
         except Exception:
             elapsed = 0
         if restart_seen or elapsed >= 46:
-            return True
-    return False
-
+            return event_type.upper() or 'MATERIAL_EVENT'
+    return None
 
 def htBoundarySafety(event_id, event, require_recorded_score=False):
     ht_score = FIRST_HALF_END_SCORES.get(event_id)
@@ -2447,82 +3155,32 @@ def htBoundarySafety(event_id, event, require_recorded_score=False):
     live_score = currentScore(event)
     if ht_score is not None and live_score is not None and list(live_score) != list(ht_score):
         return False, 'SCORE_CHANGED_AFTER_HT', list(ht_score)
-    if secondHalfGoalRecorded(event):
-        return False, 'SECOND_HALF_GOAL_ALREADY_RECORDED', list(ht_score) if ht_score is not None else None
+    material = secondHalfMaterialEventRecorded(event)
+    if material:
+        return False, material, list(ht_score) if ht_score is not None else None
     return True, '', list(ht_score) if ht_score is not None else None
 
-
 def secondHalfSignal(event, event_id, live_signals=None):
+    """Return an SHKO signal already validated by the 45/46 live-minute gate."""
     now_epoch = time.time()
+    event = normaliseTimelineEvent(event)
     minute = eventElapsedMinutes(event)
     live = (live_signals or {}).get(event_id, {}).get('SecondHalfKickOff')
     if live is not None:
-        return live.get('source'), live.get('observed_at', now_epoch), live.get('bf_minute', minute)
+        return (live.get('source'), live.get('detail_time') or live.get('observed_at', now_epoch),
+                live.get('bf_minute', minute))
 
-    # A valid persistent update timestamp may have arrived in a previous response.
-    # It is usable only while still very close to the actual restart boundary.
-    detail = transitionDetail(event, 'SecondHalfKickOff')
-    if detail is not None:
-        exact = parseBetfairTimestamp(detail.get('updateTime'))
-        if exact is not None and 0 <= now_epoch - exact <= HT_SIGNAL_FRESH_SECONDS:
-            return 'UPDATE_DETAIL', exact, minute
-
-    # If current status itself is still the restart state, observation time is
-    # the practical boundary. This also handles Betfair's 1970 update timestamp.
-    if event.get('inPlayMatchStatus') == 'SecondHalfKickOff':
-        if minute is not None and HT_SIGNAL_MINUTE_MIN <= minute <= HT_SIGNAL_MINUTE_MAX:
-            return 'STATUS', now_epoch, minute
-
-    # Narrow recovery for a literal restart signal that was missed. It is only
-    # allowed after a definitely observed FirstHalfEnd, at minute 46-48, with
-    # the score still exactly equal to the recorded half-time score and no goal.
-    if event_id in FIRST_HALF_END_TIMES and minute is not None and 46 <= minute <= HT_SIGNAL_MINUTE_MAX:
-        safe, _, ht_score = htBoundarySafety(event_id, event, require_recorded_score=True)
-        if safe and ht_score is not None:
-            return 'ELAPSED_FALLBACK', now_epoch, minute
-
+    # If the boundary was already persisted (e.g. crash during recovery), allow
+    # recovery to resume from it.  Do not manufacture a fresh boundary merely
+    # because the persistent second-half status is visible.
+    if event_id in SECOND_HALF_START_TIMES:
+        return (SECOND_HALF_START_SOURCE.get(event_id, 'RESTORED'),
+                SECOND_HALF_START_TIMES.get(event_id), minute)
     return None, None, minute
 
-
-def recoverPostStartSnapshot(team, snapshot, reference):
-    if snapshot is None:
-        return None
-
-    repaired = (collection.repair_match_odds_boundary(snapshot, reference)
-                if isMatchOddsEntry(team) else collection.repair_missing_back(snapshot, reference))
-    if repaired is not None:
-        selected = copy.deepcopy(snapshot)
-        selected['back'] = list(repaired['back'])
-        selected['lay'] = list(repaired.get('lay', snapshot.get('lay', [None, None, None])))
-        selected['book'] = repaired.get('book')
-        inferred = list(repaired.get('inferred', []))
-        method = 'INF' if inferred else 'OBS'
-        return {
-            'back': list(repaired['back']),
-            'lay': list(repaired.get('lay', snapshot.get('lay', [None, None, None]))),
-            'book': repaired.get('book'),
-            'method': method,
-            'raw': snapshot,
-            'selected': selected,
-            'inferred': inferred,
-            'request_time': snapshot.get('request_time'),
-            'response_time': snapshot.get('response_time')
-        }
-
-    if snapshotIsKosher(snapshot, reference):
-        return {
-            'back': list(snapshot['back']),
-            'lay': list(snapshot.get('lay', [None, None, None])),
-            'book': snapshot.get('book'),
-            'method': 'OBS',
-            'raw': snapshot,
-            'selected': copy.deepcopy(snapshot),
-            'inferred': [],
-            'request_time': snapshot.get('request_time'),
-            'response_time': snapshot.get('response_time')
-        }
-    return None
-
+def recoverPostStartSnapshot(team, snapshot, reference=None):
+    """Post-boundary snapshots are recorded raw; no BACK reconstruction."""
+    return _recoverBoundarySnapshot(team, snapshot, reference)
 
 def _formatHTScore(score):
     if score is None:
@@ -2541,123 +3199,427 @@ def recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score,
     logIssue(team, 'ht_capture_diagnostic', 'HT', detail)
 
 
-def captureHTBoundaryPrice(team, event, source, observed_at, bf_minute):
+
+def _activateHTRecovery(team, source, observed_at, now_epoch=None):
+    """Start/resume the shared non-blocking POST capture for SecondHalfKickOff."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
     event_id = getEventID(team)
-    market_id = getMarketID(team)
-    safe, reason, ht_score = htBoundarySafety(
-        event_id, event, require_recorded_score=(source == 'ELAPSED_FALLBACK'))
-    if not safe:
-        recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score,
-                           None, None, False, reason)
-        return None
+    state = HT_CAPTURE_STATE.setdefault(event_id, {})
+    if htIsFilled(team) or state.get('phase') in {'FROZEN', 'MISSING'}:
+        return False
 
-    reference = referencePriceHistory(market_id)
-    request_time = time.time()
-    HT_REPLENISH_LAST_ATTEMPT[event_id] = request_time
-    marketbook = getCleanExchangePricesfromWebsite([market_id], force=True)
-    response_time = time.time()
-    snapshot = extractSnapshot(team, marketbook)
-    if snapshot is None:
-        reason = 'PRICE_ENDPOINT_' + str(ENDPOINT_LAST_ERROR.get('price') or 'NO_MARKET')
-        recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score,
-                           request_time, response_time, False, reason)
+    boundary = observed_at or SECOND_HALF_START_TIMES.get(event_id)
+    if boundary is None:
+        return False
+
+    changed = False
+    desired = {
+        'phase': 'POST_RECOVERY',
+        'boundary_observed_at': boundary,
+        'source': source or SECOND_HALF_START_SOURCE.get(event_id, 'STATUS'),
+        'capture_started_at': state.get('capture_started_at') or now_epoch,
+        'recovery_deadline': boundary + BOUNDARY_RECOVERY_SECONDS,
+    }
+    if state.get('boundary_score') is None:
+        score = FIRST_HALF_END_SCORES.get(event_id)
+        if score is None:
+            score = currentScore(_safeDict(LATEST_TIMELINES.get(event_id)))
+        if score is not None:
+            desired['boundary_score'] = list(score)
+    if state.get('post_poll_count') is None:
+        desired['post_poll_count'] = 0
+    if state.get('next_retry') is None:
+        desired['next_retry'] = now_epoch
+
+    for key, value in desired.items():
+        if state.get(key) != value:
+            state[key] = value
+            changed = True
+    if changed:
         markStateDirty()
+    return True
+
+def captureHTBoundaryPrice(team, event, source, observed_at, bf_minute, initial_result=None):
+    """Compatibility wrapper: HT recovery is scheduled, never blocking."""
+    if not _activateHTRecovery(team, source, observed_at):
         return None
-
-    snapshot['request_time'] = request_time
-    snapshot['response_time'] = response_time
-    addPriceHistory(team, snapshot)
-    addCleanPriceHistory(team, snapshot, reference)
-    recovered = recoverPostStartSnapshot(team, snapshot, reference)
-    if recovered is None:
-        recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score,
-                           request_time, response_time, False, 'FRESH_PRICE_REJECTED')
-        markStateDirty()
-        return None
-
-    # The restart boundary stays fixed. A later replenish poll is accepted only
-    # while the score still matches HT and no second-half goal is recorded.
-    safe_after, reason_after, ht_score_after = htBoundarySafety(
-        event_id, event, require_recorded_score=(source == 'ELAPSED_FALLBACK'))
-    if not safe_after:
-        recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score_after,
-                           request_time, response_time, False, reason_after)
-        markStateDirty()
-        return None
-
-    recordHTDiagnostic(team, source, observed_at, bf_minute, ht_score_after,
-                       request_time, response_time, True, recovered.get('method', 'OBS'))
-    markStateDirty()
-    return recovered
-
-
-def firstKosherPostStart(team, start):
-    # Restart recovery may use only snapshots from the tiny boundary interval.
-    market_id = getMarketID(team)
-    history = sorted(PRICE_HISTORY.get(market_id, []), key=lambda item: item.get('time', 0))
-    reference = [item for item in CLEAN_PRICE_HISTORY.get(market_id, []) if item.get('time', 0) < start]
-    boundary = [item for item in history if start <= (item.get('time', 0) or 0) <= start + HT_BOUNDARY_CAPTURE_SECONDS]
-    for item in boundary:
-        recovered = recoverPostStartSnapshot(team, item, reference)
-        if recovered is not None:
-            return recovered
+    state = HT_CAPTURE_STATE.get(getEventID(team), {}) or {}
+    snapshot = _usableBoundarySnapshot(initial_result)
+    if isinstance(snapshot, dict):
+        current = state.get('post') if isinstance(state.get('post'), dict) else None
+        chosen = _betterRealSnapshot(current, snapshot)
+        if chosen is not current:
+            state['post'] = compactHistorySnapshot(chosen)
+            markStateDirty()
+        if _snapshotAcceptable(snapshot):
+            return _rawBoundaryResult(snapshot, 'HT_POST_ACCEPTABLE')
     return None
 
+def _htRecessFallbackResult(team):
+    snapshot = HT_RECESS_STATE.get(getEventID(team))
+    if not isinstance(snapshot, dict):
+        return None
+    result = _rawBoundaryResult(snapshot, 'HT_PRE_FALLBACK')
+    return result if result is not None and _realBackCount(result.get('selected')) > 0 else None
 
-def processSecondHalfStarts(timelines, live_signals=None):
-    attempted = set()
+
+def processSecondHalfStarts(timelines, live_signals=None, results=None):
+    """SecondHalfKickOff starts the same POST mechanism used for KO."""
+    results = results or {}
     now_epoch = time.time()
     for event in timelines:
+        event = normaliseTimelineEvent(event)
         event_id = collection.normalise_id(event.get('eventId'))
         team = findTeamByEvent(event_id)
         if team is None or htIsFilled(team):
             continue
 
-        existing = SECOND_HALF_START_TIMES.get(event_id)
         source, evidence_time, bf_minute = secondHalfSignal(event, event_id, live_signals)
-        if source is None:
-            if existing is None or now_epoch - existing > HT_REPLENISH_WINDOW_SECONDS:
-                continue
-            source = SECOND_HALF_START_SOURCE.get(event_id, 'UPDATE_DETAIL')
-            evidence_time = existing
-            bf_minute = eventElapsedMinutes(event)
-
-        market_id = getMarketID(team)
-        attempted.add(market_id)
-
-        # Existing boundaries are retried at the next 10-second scheduler opportunity.
-        if existing is not None:
+        if source is None and event_id not in SECOND_HALF_START_TIMES:
             continue
 
-        SECOND_HALF_START_TIMES[event_id] = evidence_time
-        SECOND_HALF_START_SOURCE[event_id] = source
-        if source == 'ELAPSED_FALLBACK':
-            logIssue(team, 'second_half_fallback', 'HT', source)
-        markStateDirty()
-
-        # One immediate request at the observed restart. A bad response stays
-        # pending instead of permanently freezing HT to zero.
-        result = captureHTBoundaryPrice(team, event, source, evidence_time, bf_minute)
-        if result is not None:
-            freezeHT(team, result, event)
+        if event_id not in SECOND_HALF_START_TIMES:
+            SECOND_HALF_START_TIMES[event_id] = evidence_time or now_epoch
+            SECOND_HALF_START_SOURCE[event_id] = source or 'STATUS'
+            markStateDirty()
         else:
-            logIssue(team, 'missing_price', 'HT', 'boundary_price_pending')
-    return attempted
+            evidence_time = SECOND_HALF_START_TIMES[event_id]
+            source = SECOND_HALF_START_SOURCE.get(event_id, source or 'STATUS')
+
+        if not _activateHTRecovery(team, source, evidence_time, now_epoch):
+            continue
+        state = HT_CAPTURE_STATE.setdefault(event_id, {})
+        market_id = getMarketID(team)
+        if secondHalfMaterialEventRecorded(event) or _boundaryScoreChanged(state, event):
+            _finaliseHTRecovery(team, reason='MATERIAL_EVENT')
+            continue
+
+        if market_id in results and int(state.get('post_poll_count') or 0) == 0:
+            state['post_poll_count'] = 1
+            snapshot = _usableBoundarySnapshot(results.get(market_id))
+            if isinstance(snapshot, dict):
+                current = state.get('post') if isinstance(state.get('post'), dict) else None
+                chosen = _betterRealSnapshot(current, snapshot)
+                if chosen is not current:
+                    state['post'] = compactHistorySnapshot(chosen)
+                    markStateDirty()
+                if _snapshotAcceptable(snapshot):
+                    state['phase'] = 'FROZEN'
+                    _clearRecoveryTiming(state)
+                    markStateDirty()
+                    freezeHT(team, _rawBoundaryResult(snapshot, 'HT_POST_ACCEPTABLE'), event)
+                    continue
+            _scheduleNextPostPoll(state, time.time())
+
+def _chooseBoundaryFallback(post, pre):
+    """Choose boundary evidence using the agreed simple hierarchy.
+
+    An acceptable POST always wins, even if PRE was fractionally prettier.  If
+    no acceptable POST exists, an acceptable PRE is the insurance.  When neither
+    side ever produced an acceptable book, retain the best complete real book by
+    overround quality, then the best partial evidence rather than invent prices.
+    """
+    if _snapshotAcceptable(post):
+        return post, 'POST'
+    if _snapshotAcceptable(pre):
+        return pre, 'PRE'
+
+    post_complete = _completeRealBack(post)
+    pre_complete = _completeRealBack(pre)
+    if post_complete and pre_complete:
+        if _snapshotQualityKey(post) > _snapshotQualityKey(pre):
+            return post, 'POST'
+        return pre, 'PRE'
+    if post_complete:
+        return post, 'POST'
+    if pre_complete:
+        return pre, 'PRE'
+
+    if isinstance(post, dict) and _realBackCount(post) > 0:
+        if isinstance(pre, dict) and _realBackCount(pre) > 0:
+            if _snapshotQualityKey(post) > _snapshotQualityKey(pre):
+                return post, 'POST_PARTIAL'
+            return pre, 'PRE_PARTIAL'
+        return post, 'POST_PARTIAL'
+    if isinstance(pre, dict) and _realBackCount(pre) > 0:
+        return pre, 'PRE_PARTIAL'
+    return None, 'MISS'
+
+def _clearRecoveryTiming(state):
+    changed = False
+    for key in ['next_retry', 'recovery_deadline', 'pre_retry_due']:
+        if key in state:
+            state.pop(key, None)
+            changed = True
+    return changed
 
 
-def _rawUnavailable(snapshot):
-    if snapshot is None:
+def _finaliseKORecovery(team, reason='DEADLINE'):
+    if team is None or koIsFilled(team):
+        return
+    market_id = getMarketID(team)
+    state = KO_CAPTURE_STATE.setdefault(market_id, {})
+    post = state.get('post') if isinstance(state.get('post'), dict) else None
+    pre = state.get('pre') if isinstance(state.get('pre'), dict) else None
+    chosen, source = _chooseBoundaryFallback(post, pre)
+
+    if chosen is not None:
+        if source == 'POST':
+            method = 'KO_POST_BEST'
+            if reason == 'MATERIAL_EVENT':
+                method = 'KO_POST_BEFORE_MATERIAL_EVENT'
+        elif source == 'PRE':
+            method = {
+                'MATERIAL_EVENT': 'KO_PRE_MATERIAL_EVENT',
+                'LATE': 'KO_PRE_LATE_FALLBACK',
+            }.get(reason, 'KO_PRE_FALLBACK')
+        elif source == 'POST_PARTIAL':
+            method = 'KO_POST_PARTIAL'
+        elif source == 'PRE_PARTIAL':
+            method = 'KO_PRE_PARTIAL_FALLBACK'
+        else:
+            method = 'KO_BEST_PARTIAL'
+        state['phase'] = 'FROZEN'
+        _clearRecoveryTiming(state)
+        markStateDirty()
+        freezeKO(team, _rawBoundaryResult(chosen, method))
+        return
+
+    state['phase'] = 'MISSING'
+    _clearRecoveryTiming(state)
+    KO_MISSING.add(market_id)
+    rememberCaptureEvidence(team, 'KO', {'method': 'MISS', 'raw': None})
+    if reason == 'LATE':
+        event = _safeDict(LATEST_TIMELINES.get(getEventID(team)))
+        elapsed = eventElapsedMinutes(event)
+        logIssue(team, 'late_start', 'KO', f'first_seen={elapsed:g}m' if elapsed is not None else 'late')
+    markStateDirty()
+
+
+def _finaliseHTRecovery(team, reason='DEADLINE'):
+    if team is None or htIsFilled(team):
+        return
+    event_id = getEventID(team)
+    state = HT_CAPTURE_STATE.setdefault(event_id, {})
+    post = state.get('post') if isinstance(state.get('post'), dict) else None
+    pre = HT_RECESS_STATE.get(event_id)
+    chosen, source = _chooseBoundaryFallback(post, pre)
+    event = normaliseTimelineEvent(LATEST_TIMELINES.get(event_id, {
+        'eventId': event_id,
+        'score': team.get('score', {}),
+        'updateDetails': team.get('updateDetails', [])
+    }))
+
+    if chosen is not None:
+        if source == 'POST':
+            method = 'HT_POST_BEST'
+            if reason == 'MATERIAL_EVENT':
+                method = 'HT_POST_BEFORE_MATERIAL_EVENT'
+        elif source == 'PRE':
+            method = 'HT_PRE_FALLBACK'
+        elif source == 'POST_PARTIAL':
+            method = 'HT_POST_PARTIAL'
+        elif source == 'PRE_PARTIAL':
+            method = 'HT_PRE_PARTIAL_FALLBACK'
+        else:
+            method = 'HT_BEST_PARTIAL'
+        state['phase'] = 'FROZEN'
+        _clearRecoveryTiming(state)
+        HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
+        markStateDirty()
+        freezeHT(team, _rawBoundaryResult(chosen, method), event)
+        return
+
+    state['phase'] = 'MISSING'
+    _clearRecoveryTiming(state)
+    HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
+    markStateDirty()
+    freezeHT(team, {
+        'back': [0.0, 0.0, 0.0],
+        'lay': [0.0, 0.0, 0.0],
+        'book': None,
+        'method': 'MISS',
+        'raw': None
+    }, event)
+    logIssue(team, 'missing_price', 'HT', 'no_real_pre_or_post_odds')
+
+
+def _activeBoundaryRecoveryDue(now_epoch=None):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    due = []
+    for team in DA_TEAMS:
+        if team is None:
+            continue
+        market_id = getMarketID(team)
+        event_id = getEventID(team)
+
+        if not koIsFilled(team):
+            state = KO_CAPTURE_STATE.get(market_id, {}) or {}
+            if state.get('phase') == 'POST_RECOVERY':
+                if state.get('next_retry') is not None:
+                    due.append(float(state.get('next_retry')))
+                if state.get('recovery_deadline') is not None:
+                    due.append(float(state.get('recovery_deadline')))
+
+        if not htIsFilled(team):
+            state = HT_CAPTURE_STATE.get(event_id, {}) or {}
+            if state.get('phase') == 'POST_RECOVERY':
+                if state.get('next_retry') is not None:
+                    due.append(float(state.get('next_retry')))
+                if state.get('recovery_deadline') is not None:
+                    due.append(float(state.get('recovery_deadline')))
+    return min(due) if due else None
+
+def _dueRecoveryJobs(now_epoch=None):
+    """Return due POST jobs keyed by market; KO/HT share one scheduler."""
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    jobs = {}
+    for team in list(DA_TEAMS):
+        if team is None:
+            continue
+        market_id = getMarketID(team)
+        event_id = getEventID(team)
+        if not market_id or not event_id:
+            continue
+
+        if not koIsFilled(team):
+            state = KO_CAPTURE_STATE.get(market_id, {}) or {}
+            if state.get('phase') == 'POST_RECOVERY':
+                deadline = float(state.get('recovery_deadline') or 0)
+                retry = float(state.get('next_retry') or 0)
+                if deadline <= now_epoch or retry <= now_epoch:
+                    jobs[market_id] = (team, 'KO_POST')
+
+        if not htIsFilled(team):
+            state = HT_CAPTURE_STATE.get(event_id, {}) or {}
+            if state.get('phase') == 'POST_RECOVERY':
+                deadline = float(state.get('recovery_deadline') or 0)
+                retry = float(state.get('next_retry') or 0)
+                if deadline <= now_epoch or retry <= now_epoch:
+                    jobs[market_id] = (team, 'HT_POST')
+    return jobs
+
+def runBoundaryRecoveryTick(refresh_timelines=True):
+    """Service all due KO/HT POST captures together, without blocking.
+
+    Each boundary gets one immediate price request and at most six further calls
+    at 15-second intervals, ending at T+90 seconds.  Before every retry we refresh
+    the timeline and stop immediately if the score changed or a red card/goal was
+    recorded.  Earlier safe POST evidence is never erased by a later event.
+    """
+    now_epoch = time.time()
+    jobs = _dueRecoveryJobs(now_epoch)
+    if not jobs:
+        return False
+
+    event_ids = sorted({getEventID(team) for team, _ in jobs.values() if getEventID(team)})
+    if refresh_timelines and event_ids:
+        refreshed = requestTrackedTimelines(event_ids)
+        if refreshed:
+            live_signals = detectLivePhaseSignals(refreshed)
+            rememberTimelineStates(refreshed, live_signals)
+            processFinished(refreshed)
+            processKOEvents(refreshed)
+            applyPendingKO(refreshed, {})
+            processSecondHalfStarts(refreshed, live_signals, {})
+
+    now_epoch = time.time()
+    jobs = _dueRecoveryJobs(now_epoch)
+    if not jobs:
+        persistState()
         return True
-    status = str(snapshot.get('status') or '').upper()
-    if status in {'SUSPENDED', 'CLOSED'}:
-        return True
-    prices = snapshot.get('back', [])
-    return len(prices) != 3 or all(price is None or price <= 1.0 for price in prices)
 
+    poll = {}
+    finalise_ko = []
+    finalise_ht = []
 
-def _rawStrong(snapshot, history):
-    return snapshot is not None and snapshotIsKosher(snapshot, history)
+    for market_id, (team, kind) in list(jobs.items()):
+        event_id = getEventID(team)
+        event = _safeDict(LATEST_TIMELINES.get(event_id))
 
+        if kind == 'KO_POST':
+            state = KO_CAPTURE_STATE.get(market_id, {}) or {}
+            material = _websiteMaterialEvent(event)
+            if material or _boundaryScoreChanged(state, event):
+                finalise_ko.append((team, 'MATERIAL_EVENT'))
+                continue
+            if not _postPollAllowed(state, now_epoch):
+                finalise_ko.append((team, 'DEADLINE'))
+                continue
+            poll[market_id] = (team, kind)
+
+        elif kind == 'HT_POST':
+            state = HT_CAPTURE_STATE.get(event_id, {}) or {}
+            material = secondHalfMaterialEventRecorded(event)
+            if material or _boundaryScoreChanged(state, event):
+                finalise_ht.append((team, 'MATERIAL_EVENT'))
+                continue
+            if not _postPollAllowed(state, now_epoch):
+                finalise_ht.append((team, 'DEADLINE'))
+                continue
+            poll[market_id] = (team, kind)
+
+    for team, reason in finalise_ko:
+        _finaliseKORecovery(team, reason)
+    for team, reason in finalise_ht:
+        _finaliseHTRecovery(team, reason)
+
+    if poll:
+        market_ids = list(poll.keys())
+        marketbook = getCleanExchangePricesfromWebsite(market_ids, force=True)
+        response_time = time.time()
+
+        for market_id, (team, kind) in poll.items():
+            event_id = getEventID(team)
+            snapshot = extractSnapshot(team, marketbook)
+            if snapshot is not None:
+                snapshot['request_time'] = now_epoch
+                snapshot['response_time'] = response_time
+
+            if kind == 'KO_POST':
+                state = KO_CAPTURE_STATE.setdefault(market_id, {})
+                state['post_poll_count'] = int(state.get('post_poll_count') or 0) + 1
+                if isinstance(snapshot, dict) and _realBackCount(snapshot) > 0:
+                    current = state.get('post') if isinstance(state.get('post'), dict) else None
+                    chosen = _betterRealSnapshot(current, snapshot)
+                    if chosen is not current:
+                        state['post'] = compactHistorySnapshot(chosen)
+                        state['post_method'] = 'KO_POST_CANDIDATE'
+                        markStateDirty()
+                    if _snapshotAcceptable(snapshot):
+                        state['phase'] = 'FROZEN'
+                        _clearRecoveryTiming(state)
+                        markStateDirty()
+                        freezeKO(team, _rawBoundaryResult(snapshot, 'KO_POST_ACCEPTABLE'))
+                        continue
+
+                if not _scheduleNextPostPoll(state, response_time):
+                    _finaliseKORecovery(team, 'DEADLINE')
+
+            elif kind == 'HT_POST':
+                state = HT_CAPTURE_STATE.setdefault(event_id, {})
+                state['post_poll_count'] = int(state.get('post_poll_count') or 0) + 1
+                HT_REPLENISH_LAST_ATTEMPT[event_id] = now_epoch
+                if isinstance(snapshot, dict) and _realBackCount(snapshot) > 0:
+                    current = state.get('post') if isinstance(state.get('post'), dict) else None
+                    chosen = _betterRealSnapshot(current, snapshot)
+                    if chosen is not current:
+                        state['post'] = compactHistorySnapshot(chosen)
+                        markStateDirty()
+                    if _snapshotAcceptable(snapshot):
+                        state['phase'] = 'FROZEN'
+                        _clearRecoveryTiming(state)
+                        HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
+                        markStateDirty()
+                        event = normaliseTimelineEvent(LATEST_TIMELINES.get(event_id, {}))
+                        freezeHT(team, _rawBoundaryResult(snapshot, 'HT_POST_ACCEPTABLE'), event)
+                        continue
+
+                if not _scheduleNextPostPoll(state, response_time):
+                    _finaliseHTRecovery(team, 'DEADLINE')
+
+    persistState()
+    return True
 
 def _rawMarketAvailable(snapshot):
     if snapshot is None:
@@ -2669,7 +3631,10 @@ def _rawMarketAvailable(snapshot):
     return all(((backs[index] or 0) > 1.0) or ((lays[index] or 0) > 1.0) for index in range(3))
 
 def freezeKO(team, result):
-    prices = result['back']
+    prices, inferred = _outputTriplet(result.get('back', []))
+    result = copy.deepcopy(result)
+    if inferred:
+        result['inferred'] = list(result.get('inferred', []) or []) + inferred
     market_id = getMarketID(team)
     event_id = getEventID(team)
     KO_MISSING.discard(market_id)
@@ -2678,21 +3643,20 @@ def freezeKO(team, result):
                   'source': FIRST_HALF_START_SOURCE.get(event_id, state.get('source', 'unknown')),
                   'phase': 'FROZEN'})
     rememberCaptureEvidence(team, 'KO', result)
-    team['output']['KO_1'] = prices[0]
-    team['output']['KO_2'] = prices[1]
-    team['output']['KO_X'] = prices[2]
+    team['output']['KO_1'], team['output']['KO_2'], team['output']['KO_X'] = prices
     updateTeamExchange(team, result.get('raw'))
     markStateDirty()
     print(f"KO: {team['output']['Home']} - {team['output']['Away']} {prices}")
-    persistState(force=True)
+    # Persisted by the enclosing normal/recovery cycle.
 
 def freezeHT(team, result, event_details):
-    prices = result['back']
+    prices, inferred = _outputTriplet(result.get('back', []))
+    result = copy.deepcopy(result)
+    if inferred:
+        result['inferred'] = list(result.get('inferred', []) or []) + inferred
     rememberCaptureEvidence(team, 'HT', result)
-    team['output']['HT_1'] = prices[0]
-    team['output']['HT_2'] = prices[1]
-    team['output']['HT_X'] = prices[2]
-    team['score'] = event_details.get('score', team.get('score', ''))
+    team['output']['HT_1'], team['output']['HT_2'], team['output']['HT_X'] = prices
+    team['score'] = _safeDict(event_details.get('score'))
 
     event_id = getEventID(team)
     scores = firstHalfScore(event_id, event_details)
@@ -2708,202 +3672,150 @@ def freezeHT(team, result, event_details):
     team['output']['HT_1/2'] = lib.doubleChance(team['output']['HT_1'], team['output']['HT_2']) if team['output']['HT_1'] and team['output']['HT_2'] else 0.0
     team['output']['MODEL_DT1'] = applyModel__DT1(team)
     team['output']['MODEL_ZZCX'] = applyModel__ZZCX(team)
-    team['output']['STAKE'] = config['Bet_Size']
     roundOutputDecimals(team['output'])
     updateTeamExchange(team, result.get('raw'))
     markStateDirty()
     print(f"HT: {team['output']['Home']} - {team['output']['Away']} {prices}")
-    persistState(force=True)
-
+    # Persisted by the enclosing normal/recovery cycle.
 
 def koIsFilled(team):
     if any(team['output'].get(key, 0) for key in ['KO_1', 'KO_2', 'KO_X']):
         return True
-    market_id = getMarketID(team)
-    if market_id not in KO_MISSING:
-        return False
-    event_id = getEventID(team)
-    source = FIRST_HALF_START_SOURCE.get(event_id) or (KO_CAPTURE_STATE.get(market_id, {}) or {}).get('source')
-    return source not in KO_SYNTHETIC_START_SOURCES
-
+    return getMarketID(team) in KO_MISSING
 
 def htIsFilled(team):
     return team['output'].get('HT_Home', '') != ''
 
 
 def preKOFocusEntries():
+    """Unresolved KO matches that still need website/timeline watching."""
     now_epoch = time.time()
     entries = {}
     for entry in NEAR_START_CATALOGUE.values():
         if entryAlreadyFinalized(entry):
             continue
         market_time = scheduledStart(entry)
-        if market_time is None:
+        if market_time is None or now_epoch < market_time - (KO_FOCUS_BEFORE_MINUTES * 60):
             continue
         team = findTeamByEvent(getEventID(entry))
         if team is not None and koIsFilled(team):
             continue
-
-        event_id = getEventID(entry)
-        actual_start = FIRST_HALF_START_TIMES.get(event_id)
-        start_source = FIRST_HALF_START_SOURCE.get(event_id)
-        if actual_start is None or not koStartSourceReliable(start_source):
-            # A scheduled/catalogue fallback is not the real KO boundary. Keep
-            # timeline watching through delayed starts until reliable evidence arrives.
-            in_window = market_time - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60)
-        else:
-            in_window = now_epoch <= actual_start + KO_BOUNDARY_RECONCILE_SECONDS
-
-        if in_window:
-            target = team or entry
-            entries[getMarketID(target)] = target
+        target = team or entry
+        entries[getMarketID(target)] = target
 
     for team in DA_TEAMS:
         if koIsFilled(team):
             continue
-        event_id = getEventID(team)
-        start = FIRST_HALF_START_TIMES.get(event_id)
-        source = FIRST_HALF_START_SOURCE.get(event_id)
-        if start is not None and koStartSourceReliable(source):
-            if start - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= start + KO_BOUNDARY_RECONCILE_SECONDS:
-                entries[getMarketID(team)] = team
-        elif not koStartSourceReliable(source):
-            market_time = scheduledStart(team)
-            if market_time is not None and market_time - (KO_FOCUS_BEFORE_MINUTES * 60) <= now_epoch <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60):
-                entries[getMarketID(team)] = team
+        market_time = scheduledStart(team)
+        if market_time is None or now_epoch < market_time - (KO_FOCUS_BEFORE_MINUTES * 60):
+            continue
+        entries[getMarketID(team)] = team
     return list(entries.values())
 
-def koStandardPriceEntries():
-    """KO price work for the ordinary 30-second cycle only.
 
-    Start three minutes before scheduled KO, retain the latest complete/plausible
-    pre-KO book and make one first post-KO observation on the first standard
-    cycle after the real start has been detected.
+def koStandardPriceEntries():
+    """Routine 30-second KO prices only in the scheduled -2 minute pre-window.
+
+    Post-KO prices are requested from the KickOff boundary handler, not by an
+    indefinite in-play watcher. This prevents a delayed market wake-up many
+    minutes into a match from being treated as KO.
     """
     now_epoch = time.time()
     entries = {}
-
     for entry in NEAR_START_CATALOGUE.values():
         if entryAlreadyFinalized(entry):
             continue
         market_time = scheduledStart(entry)
-        if market_time is None:
+        if market_time is None or not (market_time - KO_BACKUP_MAX_AGE_SECONDS <= now_epoch <= market_time):
             continue
         event_id = getEventID(entry)
         team = findTeamByEvent(event_id)
-        actual_start = FIRST_HALF_START_TIMES.get(event_id)
-        start_source = FIRST_HALF_START_SOURCE.get(event_id)
-
-        if actual_start is None or not koStartSourceReliable(start_source):
-            in_window = (market_time - (KO_FOCUS_BEFORE_MINUTES * 60)
-                         <= now_epoch
-                         <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60))
-        else:
-            in_window = now_epoch <= actual_start + KO_POST_BOUNDARY_SECONDS
-
-        if not in_window:
-            continue
         if team is None:
             team = initialiseTeam(entry, LATEST_TIMELINES.get(event_id, {}))
-        if team is not None and not koIsFilled(team):
+        if team is not None and not koIsFilled(team) and event_id not in FIRST_HALF_START_TIMES:
             entries[getMarketID(team)] = team
-
-    # A pre-KO team is deliberately created during the final three minutes so
-    # its latest valid snapshot survives a process restart in live_state.json.
     for team in DA_TEAMS:
-        if koIsFilled(team):
-            continue
-        event_id = getEventID(team)
-        actual_start = FIRST_HALF_START_TIMES.get(event_id)
-        start_source = FIRST_HALF_START_SOURCE.get(event_id)
-        if actual_start is not None and koStartSourceReliable(start_source):
-            if now_epoch <= actual_start + KO_POST_BOUNDARY_SECONDS:
-                entries[getMarketID(team)] = team
+        if koIsFilled(team) or getEventID(team) in FIRST_HALF_START_TIMES:
             continue
         market_time = scheduledStart(team)
-        if market_time is not None and (market_time - (KO_FOCUS_BEFORE_MINUTES * 60)
-                                        <= now_epoch
-                                        <= market_time + (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60)):
-            entries[getMarketID(team)] = team
-
+        if market_time is None or not (market_time - KO_BACKUP_MAX_AGE_SECONDS <= now_epoch <= market_time):
+            continue
+        entries[getMarketID(team)] = team
     return list(entries.values())
 
-
 def htRecessPriceEntries():
-    """Half-time recess prices sampled only on the ordinary 30-second cycle."""
-    entries = []
-    for team in htFocusEntries():
-        if getEventID(team) in SECOND_HALF_START_TIMES:
-            continue
-        entries.append(team)
-    return entries
+    """Pre-restart HT insurance on the ordinary 30-second heartbeat.
 
+    It begins 13 minutes after the observed FirstHalfEnd and ends the instant we
+    first observe SecondHalfKickOff.  It does not depend on Betfair continuing
+    to label the current status exactly ``FirstHalfEnd``.
+    """
+    return [team for team in htFocusEntries()
+            if getEventID(team) not in SECOND_HALF_START_TIMES]
 
 def rememberLatestPreKO(entries, results):
+    """Keep the best real PRE observation from scheduled KO -2 min to scheduled KO."""
     now_epoch = time.time()
     for entry in entries:
         market_id = getMarketID(entry)
         result = results.get(market_id) or {}
-        # LAST is an older fallback, not a new 30-second observation.
-        if result.get('method') in {'LAST', 'MISS'}:
+        snapshot = _usableBoundarySnapshot(result)
+        if snapshot is None:
             continue
-        snapshot = result.get('current_raw')
-        if snapshot is None or snapshot.get('inplay') is True:
-            continue
-        if not collection.book_is_plausible(snapshot.get('back', [])):
-            continue
-
         team = findTeamByEvent(getEventID(entry)) or entry
-        event_id = getEventID(team)
-        start = FIRST_HALF_START_TIMES.get(event_id)
-        start_source = FIRST_HALF_START_SOURCE.get(event_id)
-        # Only a genuine timeline KO boundary can close the pre-KO slot. A
-        # scheduled/catalogue fallback must not discard valid delayed pre-KO books.
-        if start is not None and koStartSourceReliable(start_source) and (snapshot.get('time', now_epoch) or now_epoch) >= start:
+        scheduled = scheduledStart(team)
+        current_time = snapshot.get('time', now_epoch) or now_epoch
+        boundary = FIRST_HALF_START_TIMES.get(getEventID(team))
+        if scheduled is None or current_time < scheduled - KO_BACKUP_MAX_AGE_SECONDS or current_time > scheduled:
+            continue
+        if boundary is not None and current_time >= boundary:
             continue
 
         state = KO_CAPTURE_STATE.setdefault(market_id, {})
         state['event_id'] = getEventID(team)
-
-        # Keep only tiny movement statistics, not every pre-KO snapshot. Each
-        # value is the total 1/2/X Betfair-tick movement from one valid 30-second
-        # observation to the next during the final three minutes.
-        previous = state.get('pre')
-        previous_time = (previous or {}).get('time') if isinstance(previous, dict) else None
-        current_time = snapshot.get('time', now_epoch)
-        if isinstance(previous, dict) and previous_time != current_time:
+        previous = state.get('pre') if isinstance(state.get('pre'), dict) else None
+        chosen = _betterRealSnapshot(previous, snapshot)
+        if chosen is previous:
+            continue
+        if isinstance(previous, dict):
             movement = _koTripletTickMove(previous.get('back', []), snapshot.get('back', []))
             if movement is not None:
                 moves = list(state.get('pm') or [])
                 moves.append(int(movement))
                 state['pm'] = moves[-6:]
-
-        state['pre'] = compactHistorySnapshot(snapshot)
-        state['pre_observed_at'] = current_time
+        state['pre'] = compactHistorySnapshot(chosen)
+        state['pre_observed_at'] = chosen.get('time', current_time)
         if state.get('phase') not in {'FROZEN', 'MISSING'}:
             state['phase'] = 'PREWATCH'
         markStateDirty()
 
+def rememberFirstPostKO(entries, results):
+    """Deprecated compatibility hook: KickOff event now drives post-KO capture."""
+    return None
 
 def rememberLatestHTRecess(entries, results):
+    """Keep the best real pre-restart book seen after FirstHalfEnd +13 minutes."""
+    now_epoch = time.time()
     for team in entries:
         event_id = getEventID(team)
-        if event_id in SECOND_HALF_START_TIMES:
+        boundary = SECOND_HALF_START_TIMES.get(event_id)
+        first_end = FIRST_HALF_END_TIMES.get(event_id)
+        if first_end is None or now_epoch < first_end + (HT_FOCUS_AFTER_FIRST_HALF_MINUTES * 60):
             continue
         result = results.get(getMarketID(team)) or {}
-        if result.get('method') in {'LAST', 'MISS'}:
+        snapshot = _usableBoundarySnapshot(result)
+        if snapshot is None:
             continue
-        snapshot = result.get('current_raw')
-        if snapshot is None or not collection.book_is_plausible(snapshot.get('back', [])):
+        observed = snapshot.get('time', now_epoch) or now_epoch
+        # Observation time relative to the boundary is what matters.  Never
+        # require a particular persistent status label here.
+        if boundary is not None and observed >= boundary:
             continue
-        # Store only a confirmed/reconstructed recess, not the broad 55-minute
-        # fallback watch used when FirstHalfEnd itself is missing.
-        event = LATEST_TIMELINES.get(event_id, {}) or {}
-        if event_id not in FIRST_HALF_END_TIMES and event.get('inPlayMatchStatus') != 'FirstHalfEnd':
-            continue
-        HT_RECESS_STATE[event_id] = compactHistorySnapshot(snapshot)
-        markStateDirty()
-
+        current = HT_RECESS_STATE.get(event_id)
+        chosen = _betterRealSnapshot(current, snapshot)
+        if chosen is not current:
+            HT_RECESS_STATE[event_id] = compactHistorySnapshot(chosen)
+            markStateDirty()
 
 def htFocusEntries():
     now_epoch = time.time()
@@ -2913,24 +3825,16 @@ def htFocusEntries():
             continue
         event_id = getEventID(team)
         first_half_end = FIRST_HALF_END_TIMES.get(event_id)
-        if first_half_end is not None:
-            focus_start = first_half_end + (HT_FOCUS_AFTER_FIRST_HALF_MINUTES * 60)
-        else:
-            kickoff = FIRST_HALF_START_TIMES.get(event_id)
-            if kickoff is None:
-                continue
-            focus_start = kickoff + (55 * 60)
-
+        if first_half_end is None:
+            continue
+        focus_start = first_half_end + (HT_FOCUS_AFTER_FIRST_HALF_MINUTES * 60)
         if now_epoch < focus_start:
             continue
         second_half_start = SECOND_HALF_START_TIMES.get(event_id)
-        if second_half_start is not None and now_epoch > second_half_start + HT_BOUNDARY_CAPTURE_SECONDS:
-            continue
-        if first_half_end is None and second_half_start is None and now_epoch > focus_start + (20 * 60):
+        if second_half_start is not None:
             continue
         entries.append(team)
     return entries
-
 
 def minuteFocusEntries():
     entries = []
@@ -2946,87 +3850,26 @@ def minuteFocusEntries():
     return entries
 
 
-def focusEntries():
-    entries = preKOFocusEntries() + htFocusEntries() + minuteFocusEntries()
-    result = {}
-    for entry in entries:
-        market_id = getMarketID(entry)
-        if market_id:
-            result[market_id] = entry
-    return list(result.values())
-
-
-def pendingHTMarketIDs():
-    return {getMarketID(team) for team in DA_TEAMS
-            if not htIsFilled(team) and getEventID(team) in SECOND_HALF_START_TIMES}
-
-
-def retryPendingHT(timelines):
-    by_event = {collection.normalise_id(event.get('eventId')): event for event in timelines}
-    now_epoch = time.time()
-    for team in list(DA_TEAMS):
-        if htIsFilled(team):
-            continue
-        event_id = getEventID(team)
-        start = SECOND_HALF_START_TIMES.get(event_id)
-        if start is None or now_epoch > start + HT_REPLENISH_WINDOW_SECONDS:
-            continue
-
-        # No fresh timeline means no price request: a stale score must never
-        # allow a post-goal price to be labelled HT.
-        event = by_event.get(event_id)
-        if event is None:
-            continue
-
-        source = SECOND_HALF_START_SOURCE.get(event_id, 'UPDATE_DETAIL')
-        safe, reason, score = htBoundarySafety(
-            event_id, event, require_recorded_score=(source == 'ELAPSED_FALLBACK'))
-        if not safe:
-            recordHTDiagnostic(team, source, start, eventElapsedMinutes(event), score,
-                               None, None, False, reason)
-            freezeHT(team, {'back': [0.0, 0.0, 0.0], 'lay': [0.0, 0.0, 0.0],
-                            'book': None, 'method': 'MISS', 'raw': None}, event)
-            HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
-            logIssue(team, 'missing_price', 'HT', reason.lower())
-            continue
-
-        last_attempt = HT_REPLENISH_LAST_ATTEMPT.get(event_id, start)
-        if now_epoch - last_attempt < HT_REPLENISH_POLL_SECONDS:
-            continue
-
-        result = captureHTBoundaryPrice(team, event, source, start, eventElapsedMinutes(event))
-        if result is not None:
-            freezeHT(team, result, event)
-            HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
-
-
-def applyPendingHT(timelines, results=None):
-    by_event = {collection.normalise_id(event.get('eventId')): event for event in timelines}
-    now_epoch = time.time()
-    for team in list(DA_TEAMS):
-        if htIsFilled(team):
-            continue
-        event_id = getEventID(team)
-        start = SECOND_HALF_START_TIMES.get(event_id)
-        if start is None or now_epoch <= start + HT_REPLENISH_WINDOW_SECONDS:
-            continue
-        event = by_event.get(event_id) or LATEST_TIMELINES.get(event_id, {})
-        score = firstHalfScore(event_id, event)
-        recordHTDiagnostic(team, SECOND_HALF_START_SOURCE.get(event_id, ''), start,
-                           eventElapsedMinutes(event), score, None, None, False,
-                           'REPLENISH_WINDOW_EXPIRED')
-        freezeHT(team, {'back': [0.0, 0.0, 0.0], 'lay': [0.0, 0.0, 0.0],
-                        'book': None, 'method': 'MISS', 'raw': None}, event)
-        HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
-        logIssue(team, 'missing_price', 'HT', 'replenish_window_expired')
-
-
 def eventFinished(event):
-    if (event.get('inPlayMatchStatus') == 'Finished' or hasTransition(event, 'Finished') or
-            hasTransition(event, 'SecondHalfEnd')):
+    event = _safeDict(event)
+    score = _safeDict(event.get('score'))
+    home = _safeDict(score.get('home'))
+    away = _safeDict(score.get('away'))
+
+    # Explicit FT scores are definitive even if the status lags. Conversely a
+    # Finished status without any usable score must not create a fabricated row.
+    if (home.get('fullTimeScore') not in [None, ''] and
+            away.get('fullTimeScore') not in [None, '']):
         return True
-    score = event.get('score', {})
-    return score.get('home', {}).get('fullTimeScore') not in [None, ''] and score.get('away', {}).get('fullTimeScore') not in [None, '']
+
+    finished_signal = (
+        event.get('inPlayMatchStatus') == 'Finished' or
+        hasTransition(event, 'Finished') or
+        hasTransition(event, 'SecondHalfEnd')
+    )
+    return (finished_signal and
+            home.get('score') not in [None, ''] and
+            away.get('score') not in [None, ''])
 
 
 def cleanupEventState(team):
@@ -3044,6 +3887,7 @@ def cleanupEventState(team):
     SECOND_HALF_START_SOURCE.pop(event_id, None)
     HT_REPLENISH_LAST_ATTEMPT.pop(event_id, None)
     HT_RECESS_STATE.pop(event_id, None)
+    HT_CAPTURE_STATE.pop(event_id, None)
     LATEST_TIMELINES.pop(event_id, None)
     NEAR_START_CATALOGUE.pop(event_id, None)
     CURRENT_INPLAY_CATALOGUE.pop(event_id, None)
@@ -3059,17 +3903,50 @@ def cleanupEventState(team):
 
 def finaliseTeam(team, event):
     normaliseTeamOutput(team)
-    team['score'] = event.get('score', team.get('score', ''))
-    team['updateDetails'] = event.get('updateDetails', team.get('updateDetails', ''))
-    score = team.get('score', {})
+    event = normaliseTimelineEvent(event)
+    event_score = _safeDict(event.get('score'))
+    if event_score:
+        team['score'] = event_score
+    else:
+        team['score'] = _safeDict(team.get('score'))
+    event_details = _safeDetails(event.get('updateDetails'))
+    if event_details:
+        team['updateDetails'] = event_details
+    else:
+        team['updateDetails'] = _safeDetails(team.get('updateDetails'))
+    score = _safeDict(team.get('score'))
+    home_score = _safeDict(score.get('home'))
+    away_score = _safeDict(score.get('away'))
     ht_scores = firstHalfScore(getEventID(team), event)
     if ht_scores is not None:
         team['output']['HT_Home'] = str(ht_scores[0])
         team['output']['HT_Away'] = str(ht_scores[1])
-    team['output']['FT_Home'] = score.get('home', {}).get('fullTimeScore') or score.get('home', {}).get('score', '')
-    team['output']['FT_Away'] = score.get('away', {}).get('fullTimeScore') or score.get('away', {}).get('score', '')
-    team['output']['STAKE'] = config['Bet_Size']
+
+    # If Betfair never delivered a usable SecondHalfKickOff signal, a valid
+    # pre-restart book collected from FirstHalfEnd +13 minutes must not be lost.
+    # Use it at finalisation when the recorded HT triplet is absent/incomplete.
+    current_ht_count = 0
+    for key in ['HT_1', 'HT_2', 'HT_X']:
+        try:
+            if float(team['output'].get(key) or 0) > 1.0:
+                current_ht_count += 1
+        except Exception:
+            pass
+    if current_ht_count < 3:
+        pre_result = _htRecessFallbackResult(team)
+        pre_snapshot = pre_result.get('selected') if isinstance(pre_result, dict) else None
+        if _completeRealBack(pre_snapshot):
+            freezeHT(team, pre_result, event)
+
+    team['output']['FT_Home'] = home_score.get('fullTimeScore') or home_score.get('score', '')
+    team['output']['FT_Away'] = away_score.get('fullTimeScore') or away_score.get('score', '')
     team['output']['FINAL'] = getFINAL(team['output'])
+
+    # Always evaluate the strategies from the final preserved HT state. This
+    # fixes rows where HT score arrived only at finalisation and MODEL_* was
+    # previously left blank. Missing/non-executable HT odds are recorded as NO.
+    team['output']['MODEL_DT1'] = applyModel__DT1(team)
+    team['output']['MODEL_ZZCX'] = applyModel__ZZCX(team)
     team['output']['MULTI_DT1'] = getMULTI(team['output'], 'MODEL_DT1')
     team['output']['MULTI_ZZCX'] = getMULTI(team['output'], 'MODEL_ZZCX')
     team['output']['P/L_DT1'] = getPL(team['output'], 'MULTI_DT1')
@@ -3116,57 +3993,80 @@ def processFinished(timelines):
         finaliseTeam(team, event)
 
 
-def refreshCatalogueCaches(current_catalogue, near_start_catalogue):
+def refreshCatalogueCaches(current_catalogue, near_start_catalogue, current_catalogue_ok=True):
+    """Refresh Betfair's discovery caches.
+
+    A successful current-catalogue response is authoritative for which football
+    markets Betfair still regards as active.  No local four-hour (or similar)
+    delayed-KO lifetime is imposed.  Near-start cache ageing is only discovery
+    housekeeping; an active market returned by Betfair remains in the current
+    catalogue regardless of its originally scheduled KO.
+    """
+    global CATALOGUE_ACTIVE_BASELINE_READY
+
     current = {getEventID(entry): entry for entry in current_catalogue
                if getEventID(entry) and not entryAlreadyFinalized(entry)}
-    if CURRENT_INPLAY_CATALOGUE != current:
-        CURRENT_INPLAY_CATALOGUE.clear()
-        CURRENT_INPLAY_CATALOGUE.update(current)
-        markStateDirty()
+    old_ids = set(CURRENT_INPLAY_CATALOGUE)
+    new_ids = set(current)
+    NEWLY_ACTIVE_CATALOGUE_IDS.clear()
+    if current_catalogue_ok:
+        if CATALOGUE_ACTIVE_BASELINE_READY:
+            NEWLY_ACTIVE_CATALOGUE_IDS.update(new_ids - old_ids)
+        else:
+            # Never call every in-play match a fresh KO merely because the process
+            # has just started in the middle of a match.
+            CATALOGUE_ACTIVE_BASELINE_READY = True
+
+        if CURRENT_INPLAY_CATALOGUE != current:
+            CURRENT_INPLAY_CATALOGUE.clear()
+            CURRENT_INPLAY_CATALOGUE.update(current)
 
     for entry in near_start_catalogue:
         event_id = getEventID(entry)
         if not event_id:
             continue
         if entryAlreadyFinalized(entry):
-            if event_id in NEAR_START_CATALOGUE:
-                NEAR_START_CATALOGUE.pop(event_id, None)
-                markStateDirty()
+            NEAR_START_CATALOGUE.pop(event_id, None)
             continue
-        if NEAR_START_CATALOGUE.get(event_id) != entry:
-            NEAR_START_CATALOGUE[event_id] = entry
-            markStateDirty()
+        NEAR_START_CATALOGUE[event_id] = entry
 
-    cutoff = time.time() - (KO_KEEP_AFTER_SCHEDULE_MINUTES * 60 * 2)
+    # This only trims stale near-start discovery metadata.  It does not expire a
+    # match which Betfair still returns in CURRENT_INPLAY_CATALOGUE, nor does it
+    # remove an already tracked team/state fallback.
+    cutoff = time.time() - (KO_CATALOGUE_LOOKBACK_MINUTES * 60 * 2)
     expired = []
     for event_id, entry in NEAR_START_CATALOGUE.items():
         market_time = scheduledStart(entry)
         team = findTeamByEvent(event_id)
-        if entryAlreadyFinalized(entry) or (team is None and market_time is not None and market_time < cutoff):
+        active = event_id in CURRENT_INPLAY_CATALOGUE
+        if entryAlreadyFinalized(entry) or (
+                not active and team is None and market_time is not None and market_time < cutoff):
             expired.append(event_id)
     for event_id in expired:
         NEAR_START_CATALOGUE.pop(event_id, None)
-        markStateDirty()
 
 def essentialTimeline(event):
-    if not isinstance(event, dict):
+    event = normaliseTimelineEvent(event)
+    if not event:
         return {}
-    keep_types = {'KickOff', 'FirstHalfEnd', 'SecondHalfKickOff', 'Finished', 'Goal'}
+    keep_types = {'KickOff', 'FirstHalfEnd', 'SecondHalfKickOff', 'Finished', 'Goal', 'RedCard', 'SendingOff', 'Dismissal'}
     details = []
-    for item in event.get('updateDetails', []) or []:
+    for item in _safeDetails(event.get('updateDetails')):
         event_type = item.get('updateType') or item.get('type')
         if event_type not in keep_types:
             continue
         details.append({key: item.get(key) for key in
                         ['updateTime', 'matchTime', 'elapsedRegularTime', 'elapsedAddedTime',
                          'type', 'updateType', 'team', 'teamName'] if key in item})
-    score = event.get('score', {}) or {}
+    score = _safeDict(event.get('score'))
+    home_score = _safeDict(score.get('home'))
+    away_score = _safeDict(score.get('away'))
     return {
         'status': event.get('inPlayMatchStatus', ''),
         'elapsed': event.get('elapsedRegularTime'),
         'score': {
-            'home': {key: score.get('home', {}).get(key, '') for key in ['score', 'halfTimeScore', 'fullTimeScore']},
-            'away': {key: score.get('away', {}).get(key, '') for key in ['score', 'halfTimeScore', 'fullTimeScore']}
+            'home': {key: home_score.get(key, '') for key in ['score', 'halfTimeScore', 'fullTimeScore']},
+            'away': {key: away_score.get(key, '') for key in ['score', 'halfTimeScore', 'fullTimeScore']}
         },
         'events': details
     }
@@ -3208,15 +4108,16 @@ def compactEvidence(evidence):
     return result
 
 def _legacyTimelineToCompact(timeline):
-    if not isinstance(timeline, dict):
+    timeline = normaliseTimelineEvent(timeline)
+    if not timeline:
         return {}
-    score = timeline.get('score', {}) or {}
-    home = score.get('home', {}) or {}
-    away = score.get('away', {}) or {}
+    score = _safeDict(timeline.get('score'))
+    home = _safeDict(score.get('home'))
+    away = _safeDict(score.get('away'))
     code_map = {'KickOff': 'K', 'FirstHalfEnd': 'F', 'SecondHalfKickOff': 'S',
                 'Finished': 'E', 'SecondHalfEnd': 'E', 'Goal': 'G'}
     events = []
-    for item in timeline.get('events', []) or timeline.get('updateDetails', []) or []:
+    for item in (_safeDetails(timeline.get('events')) or _safeDetails(timeline.get('updateDetails'))):
         kind = item.get('updateType') or item.get('type')
         code = code_map.get(kind)
         if code is None:
@@ -3369,6 +4270,22 @@ def _mergeMatchRecords(base, incoming):
     return result
 
 
+def _recordMatchDay(record, fallback_day=None):
+    if isinstance(record, dict):
+        for value in [record.get('dt'), (record.get('o', {}) or {}).get('Date')]:
+            epoch = parseBetfairTimestamp(value)
+            if epoch is not None:
+                return betfairAPI.datetime.datetime.fromtimestamp(
+                    epoch, betfairAPI.datetime.timezone.utc).strftime('%Y%m%d')
+    if isinstance(fallback_day, str) and len(fallback_day) == 8 and fallback_day.isdigit():
+        return fallback_day
+    return None
+
+
+def _dumpRecordKey(record):
+    return record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
+
+
 def _readDumpRecords(day):
     filename = f"{day}_dump.json"
     data = state_store.read_json(filename) if os.path.isfile(filename) else None
@@ -3398,18 +4315,20 @@ def _writeDumpRecords(day, records):
     old = state_store.read_json(filename) if os.path.isfile(filename) else None
     if isinstance(old, dict) and old.get('v') == LIVE_STATE_SCHEMA and state_store.state_hash(old) == state_store.state_hash(payload):
         return False
-    state_store.atomic_write_json(payload, filename, backup=True)
+    # A daily dump is a natural persistent file, not a rotating runtime state.
+    # Atomic replacement is enough; do not leave a per-day .bak behind.
+    state_store.atomic_write_json(payload, filename, backup=False)
     return True
 
 
-def saveDayDump(day, teams, archive_reason='U'):
-    if not teams:
-        return
+def saveDayDump(day, teams=None, archive_reason='U'):
     records = _readDumpRecords(day)
-    for team in teams:
+    for team in teams or []:
         record = matchRecordFromTeam(team, archive_reason=archive_reason)
         key = record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
         records[key] = _mergeMatchRecords(records.get(key), record)
+    # Deliberately write an empty schema-v2 dump when there are no records.
+    # This keeps every closed day JSON-readable without special cases.
     _writeDumpRecords(day, records)
 
 
@@ -3418,29 +4337,78 @@ def saveProblemRecord(day, team, archive_reason='P'):
 
 
 def migrateLegacyDumpFiles():
-    days = set()
+    """Normalise all dump material and split any mixed-day file by fixture day.
+
+    Old checkpoint/dump variants could contain matches from more than one day.
+    The filename is therefore only a fallback; the fixture timestamp is authoritative.
+    """
+    source_days = set()
     for filename in os.listdir('.'):
-        if len(filename) >= 18 and filename[:8].isdigit() and (filename.endswith('_dump.json') or filename.endswith('_dump_state.json')):
-            days.add(filename[:8])
-    for day in sorted(days):
+        if len(filename) >= 18 and filename[:8].isdigit() and (
+                filename.endswith('_dump.json') or filename.endswith('_dump_state.json')):
+            source_days.add(filename[:8])
+    if not source_days:
+        return False
+
+    # Never overwrite a dump we cannot read. It is better to leave an old file
+    # untouched than lose forensic material while trying to repartition it.
+    raw_dumps = {}
+    raw_states = {}
+    for day in sorted(source_days):
         dump_name = f"{day}_dump.json"
-        current = state_store.read_json(dump_name) if os.path.isfile(dump_name) else None
-        if isinstance(current, dict) and current.get('v') == LIVE_STATE_SCHEMA and isinstance(current.get('matches'), dict):
-            continue
-        records = _readDumpRecords(day)
+        if os.path.isfile(dump_name):
+            data = state_store.read_json(dump_name)
+            if not (isinstance(data, list) or (isinstance(data, dict) and
+                    data.get('v') == LIVE_STATE_SCHEMA and isinstance(data.get('matches'), dict))):
+                print(f"DUMP MIGRATE deferred: unreadable/unknown {dump_name}")
+                return False
+            raw_dumps[day] = data
         state_name = f"{day}_dump_state.json"
-        legacy_state = lib.readFromJSON(state_name) if os.path.isfile(state_name) else []
-        if isinstance(legacy_state, list):
-            for raw in legacy_state:
-                reason = 'P' if str(raw.get('state_reason', '')).lower() == 'finalized_problematic' else 'U'
-                record = _legacyForensicToRecord(raw, day, reason)
+        if os.path.isfile(state_name):
+            data = state_store.read_json(state_name)
+            if not isinstance(data, list):
+                print(f"DUMP MIGRATE deferred: unreadable/unknown {state_name}")
+                return False
+            raw_states[day] = data
+
+    buckets = {}
+
+    def add_record(record, source_day):
+        if record is None:
+            return
+        target_day = _recordMatchDay(record, source_day)
+        if target_day is None:
+            return
+        normaliseMatchRecordOutput(record)
+        key = _dumpRecordKey(record)
+        target = buckets.setdefault(target_day, {})
+        target[key] = _mergeMatchRecords(target.get(key), record)
+
+    for source_day, data in raw_dumps.items():
+        if isinstance(data, dict):
+            for record in (data.get('matches', {}) or {}).values():
+                add_record(copy.deepcopy(record), source_day)
+        else:
+            for raw in data:
+                record = _legacyTeamToRecord(raw, 'U')
                 if record is None:
-                    continue
-                key = record.get('id') or f"{record.get('dt')}|{record.get('h')}|{record.get('a')}"
-                records[key] = _mergeMatchRecords(records.get(key), record)
-        if records:
-            _writeDumpRecords(day, records)
-            print(f"MIGRATE: {day} dump -> schema v{LIVE_STATE_SCHEMA} ({len(records)} match(es))")
+                    record = _legacyForensicToRecord(raw, source_day, 'U')
+                add_record(record, source_day)
+
+    for source_day, rows in raw_states.items():
+        for raw in rows:
+            reason = 'P' if str(raw.get('state_reason', '')).lower() == 'finalized_problematic' else 'U'
+            add_record(_legacyForensicToRecord(raw, source_day, reason), source_day)
+
+    changed = False
+    # Keep every original source day as a valid JSON dump even when all of its
+    # records actually belong to another day. New target days are created too.
+    for day in sorted(source_days | set(buckets)):
+        records = buckets.get(day, {})
+        if _writeDumpRecords(day, records):
+            changed = True
+            print(f"DUMP NORMALISE: {day} ({len(records)} match(es))")
+    return changed
 
 
 def captureNeedsForensicState(team):
@@ -3449,14 +4417,16 @@ def captureNeedsForensicState(team):
     ht_missing = not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X'])
     score_missing = output.get('HT_Home', '') in ['', '-1'] or output.get('HT_Away', '') in ['', '-1']
     evidence = CAPTURE_EVIDENCE.get(getMarketID(team), {})
-    suspect_methods = {'MIX', 'INF', 'MISS'}
-    ko_method = evidence.get('KO', {}).get('method')
-    ht_method = evidence.get('HT', {}).get('method')
-    inferred = bool(evidence.get('KO', {}).get('inferred') or evidence.get('HT', {}).get('inferred'))
-    reconstructed = ko_method in suspect_methods or ht_method in suspect_methods or inferred
+    ko_method = str(evidence.get('KO', {}).get('method') or '')
+    ht_method = str(evidence.get('HT', {}).get('method') or '')
+    nonideal = {
+        'MISS', 'KO_POST_BEST', 'KO_POST_PARTIAL', 'KO_PRE_FALLBACK',
+        'KO_PRE_LATE_FALLBACK', 'KO_PRE_MATERIAL_EVENT', 'HT_POST_BEST',
+        'HT_POST_PARTIAL', 'HT_PRE_FALLBACK'
+    }
+    fallback_or_poor = ko_method in nonideal or ht_method in nonideal
     fallback_ht = SECOND_HALF_START_SOURCE.get(getEventID(team), '') == 'ELAPSED_FALLBACK'
-    return ko_missing or ht_missing or score_missing or reconstructed or fallback_ht
-
+    return ko_missing or ht_missing or score_missing or fallback_or_poor or fallback_ht
 
 def finaliseRestoredMatchesFromState():
     # A restored state may already contain a definitive end-of-match signal.
@@ -3467,9 +4437,11 @@ def finaliseRestoredMatchesFromState():
         if event is None:
             event = {
                 'eventId': event_id,
-                'score': team.get('score', {}),
-                'updateDetails': team.get('updateDetails', [])
+                'score': _safeDict(team.get('score')),
+                'updateDetails': _safeDetails(team.get('updateDetails'))
             }
+        else:
+            event = normaliseTimelineEvent(event)
         if eventFinished(event):
             finaliseTeam(team, event)
 
@@ -3479,7 +4451,9 @@ def finalRecoveryNeeded(team, now_epoch=None):
     day = matchStartDay(team)
     close_epoch = dayCloseEpoch(day) if day else None
     if close_epoch is not None and now_epoch >= close_epoch:
-        return True, 'CLOSED_DAY'
+        # Closed days are archived immediately by closeDueMatchDays(). Do not
+        # keep yesterday's records alive merely to spend recovery requests.
+        return False, ''
 
     start = scheduledStart(team)
     if start is None:
@@ -3539,48 +4513,75 @@ def recordFinalRecoveryAttempts(requested_event_ids):
         markStateDirty()
 
 
-def archiveExhaustedClosedRecoveries(now_epoch=None):
-    now_epoch = time.time() if now_epoch is None else now_epoch
-    groups = {}
-    for team in list(DA_TEAMS):
-        event_id = getEventID(team)
-        state = FINAL_RECOVERY_STATE.get(event_id)
-        if not isinstance(state, dict):
-            continue
-        if int(state.get('a', 0) or 0) < FINAL_RECOVERY_MAX_ATTEMPTS:
-            continue
-        day = matchStartDay(team)
-        close_epoch = dayCloseEpoch(day) if day else None
-        if close_epoch is None or now_epoch < close_epoch:
-            continue
-        groups.setdefault((day, state.get('ar', 'U')), []).append(team)
+def _closedDayEvent(team):
+    event_id = getEventID(team)
+    event = LATEST_TIMELINES.get(event_id)
+    if isinstance(event, dict) and event:
+        return event
+    return {
+        'eventId': event_id,
+        'score': team.get('score', {}) if isinstance(team, dict) else {},
+        'updateDetails': team.get('updateDetails', []) if isinstance(team, dict) else []
+    }
 
-    for (day, archive_reason), teams in sorted(groups.items()):
-        saveDayDump(day, teams, archive_reason=archive_reason or 'U')
-        print(f"FINAL RECOVERY: {len(teams)} unresolved match(es) -> {day}_dump.json")
-        purgeTeams(teams)
-        removeClosedDayRuntimeFiles(day)
-    if groups:
-        persistState(force=True)
+
+def closedDayLimitationDetail(team):
+    event = _closedDayEvent(team)
+    minute = eventElapsedMinutes(event)
+    if minute is None:
+        if getEventID(team) in SECOND_HALF_START_TIMES:
+            up_to = '2H'
+        elif getEventID(team) in FIRST_HALF_END_TIMES:
+            up_to = 'HT'
+        elif getEventID(team) in FIRST_HALF_START_TIMES:
+            up_to = 'KO'
+        else:
+            up_to = '?'
+    else:
+        up_to = str(int(minute)) if float(minute).is_integer() else f"{minute:.1f}"
+
+    output = team.get('output', {}) if isinstance(team, dict) else {}
+    missing = []
+    if not all(float(output.get(key, 0) or 0) > 0 for key in ['KO_1', 'KO_2', 'KO_X']):
+        missing.append('KO')
+    if output.get('HT_Home', '') in ['', '-1', None] or output.get('HT_Away', '') in ['', '-1', None]:
+        missing.append('HT_SCORE')
+    if not all(float(output.get(key, 0) or 0) > 0 for key in ['HT_1', 'HT_2', 'HT_X']):
+        missing.append('HT_ODDS')
+    if output.get('FT_Home', '') in ['', '-1', None] or output.get('FT_Away', '') in ['', '-1', None]:
+        missing.append('FT')
+
+    detail = f"up_to={up_to}"
+    if minute is not None:
+        detail += "'"
+    if missing:
+        detail += ';missing=' + ','.join(missing)
+    return detail
+
+
+def logClosedDayPartial(team):
+    logIssue(team, 'closed_partial', 'DUMP', closedDayLimitationDetail(team))
 
 
 def closedDayTransientFiles(day):
     return [
         f"{day}_checkpoint.json", f"{day}_checkpoint.json.bak", f"{day}_checkpoint.json.tmp",
-        f"{day}_run_dump.json", f"{day}_run_dump.json.tmp"
+        f"{day}_run_dump.json", f"{day}_run_dump.json.bak", f"{day}_run_dump.json.tmp",
+        f"{day}_dump_state.json", f"{day}_dump_state.json.bak", f"{day}_dump_state.json.tmp",
+        f"{day}_dump.json.bak", f"{day}_dump.json.tmp",
+        f"{day}_results.csv.pre_repair.bak"
     ]
 
 
 def removeClosedDayRuntimeFiles(day):
-    # Legacy runtime files are no longer written. Remove only after their day is
-    # safely represented in the new dump/results structures.
     removed = []
     for filename in closedDayTransientFiles(day):
         if os.path.isfile(filename):
             os.remove(filename)
             removed.append(filename)
     if removed:
-        print(f"Removed legacy runtime files for {day}: {', '.join(removed)}")
+        print(f"Closed {day}: removed {len(removed)} transient file(s)")
+    return bool(removed)
 
 
 def dueMatchDayGroups(now_epoch=None):
@@ -3594,22 +4595,87 @@ def dueMatchDayGroups(now_epoch=None):
     return groups
 
 
-def closeDueMatchDays(now_epoch=None):
+def storedMatchDays():
+    suffixes = (
+        '_results.csv', '_dump.json', '_log.txt', '_checkpoint.json',
+        '_checkpoint.json.bak', '_run_dump.json', '_run_dump.json.bak',
+        '_dump_state.json', '_dump_state.json.bak', '_dump.json.bak',
+        '_results.csv.pre_repair.bak'
+    )
+    days = set()
+    for filename in os.listdir('.'):
+        if len(filename) < 9 or not filename[:8].isdigit():
+            continue
+        if any(filename.endswith(suffix) for suffix in suffixes):
+            days.add(filename[:8])
+    return days
+
+
+def _liveStateFileHasClosedMatches(filename, now_epoch):
+    data = state_store.read_json(filename) if os.path.isfile(filename) else None
+    if not isinstance(data, dict) or not isinstance(data.get('matches'), dict):
+        return False
+    for record in data['matches'].values():
+        date_text = (record or {}).get('dt', '')
+        epoch = parseBetfairTimestamp(date_text)
+        if epoch is None:
+            continue
+        day = betfairAPI.datetime.datetime.fromtimestamp(
+            epoch, betfairAPI.datetime.timezone.utc).strftime('%Y%m%d')
+        close_epoch = dayCloseEpoch(day)
+        if close_epoch is not None and now_epoch >= close_epoch:
+            return True
+    return False
+
+
+def closeDueMatchDays(now_epoch=None, restored=False):
+    now_epoch = time.time() if now_epoch is None else now_epoch
+
+    # First promote anything already known to be Finished into results.csv.
+    # Everything else from a closed day is intentionally preserved as partial
+    # forensic data rather than left in live state past the 04:00 boundary.
+    finaliseRestoredMatchesFromState()
     groups = dueMatchDayGroups(now_epoch)
-    if not groups:
-        return
 
-    # A due day is not dumped merely because the clock crossed 04:00 UTC.
-    # The current Standard cycle is the first dedicated final-recovery attempt;
-    # a remaining match gets one more scheduler opportunity before archival.
-    if ENDPOINT_LAST_ERROR.get('timeline') is not None:
-        print('Closed-day housekeeping deferred: timeline endpoint unavailable')
-        return
+    days = set(groups) | storedMatchDays()
+    closed_days = {day for day in days
+                   if dayCloseEpoch(day) is not None and now_epoch >= dayCloseEpoch(day)}
 
-    scheduleFinalRecoveryJobs(now_epoch=now_epoch)
-    archiveExhaustedClosedRecoveries(now_epoch=now_epoch)
-    persistState()
+    state_needs_sync = (
+        _liveStateFileHasClosedMatches(LIVE_STATE_FILE, now_epoch) or
+        _liveStateFileHasClosedMatches(LIVE_STATE_FILE + '.bak', now_epoch)
+    )
+    changed = False
 
+    for day in sorted(closed_days):
+        teams = list(groups.get(day, []))
+        if teams:
+            for team in teams:
+                logClosedDayPartial(team)
+            saveDayDump(day, teams, archive_reason='R' if restored else 'U')
+            purgeTeams(teams)
+            print(f"DAY CLOSE: {len(teams)} partial match(es) -> {day}_dump.json")
+            changed = True
+        else:
+            # The dump file exists for every closed day even when there was
+            # nothing unresolved to archive.
+            before = os.path.isfile(f"{day}_dump.json")
+            saveDayDump(day, [])
+            changed = changed or not before
+
+        changed = removeClosedDayRuntimeFiles(day) or changed
+
+    if changed or state_needs_sync:
+        # Both recovery files must contain only still-live current-day matches.
+        persistState(force=True, sync_backup=True)
+
+    return changed or state_needs_sync
+
+
+def archiveExhaustedClosedRecoveries(now_epoch=None):
+    # Compatibility wrapper for older call sites. Day closure is now deterministic
+    # and does not depend on recovery-attempt counters.
+    return closeDueMatchDays(now_epoch=now_epoch)
 
 def purgeTeams(teams):
     for team in list(teams):
@@ -3619,81 +4685,100 @@ def purgeTeams(teams):
     markStateDirty()
 
 
-def focusedCycle():
-    ko_watch = preKOFocusEntries()
-    ht_watch = htFocusEntries()
-    pending_market_ids = pendingHTMarketIDs()
-    pending_teams = [team for team in DA_TEAMS if getMarketID(team) in pending_market_ids]
-    recovery_teams = finalRecoveryEntries()
-    minute_watch = minuteFocusEntries()
-
-    watched = {}
-    for entry in ko_watch + ht_watch + pending_teams + recovery_teams + minute_watch:
-        event_id = getEventID(entry)
-        if event_id:
-            watched[event_id] = entry
-    if not watched:
-        return
-
-    print(
-        f"Intermediate timeline watch: {len(watched)} event(s) "
-        f"[KO={len(ko_watch)}, HT={len(ht_watch)}, HT-pending={len(pending_teams)}, "
-        f"recovery={len(recovery_teams)}]"
-    )
-    timelines = requestTrackedTimelines(list(watched.keys())) if watched else []
-    live_signals = detectLivePhaseSignals(timelines)
-    rememberTimelineStates(timelines, live_signals)
-    processFinished(timelines)
-    recordFinalRecoveryAttempts(watched.keys())
-    archiveExhaustedClosedRecoveries()
-    processKOEvents(timelines)
-
-    # No blanket 10-second odds polling. HT prices are requested only when a
-    # restart is actually detected or while a just-detected boundary is pending.
-    processSecondHalfStarts(timelines, live_signals)
-    retryPendingHT(timelines)
-    applyPendingHT(timelines)
-    persistState()
-
-def intermediateWorkNeeded():
-    return bool(focusEntries() or pendingHTMarketIDs() or finalRecoveryEntries())
+def _catalogueResultValid(result):
+    """Betfair listMarketCatalogue returns a JSON array on every valid call."""
+    return isinstance(result, list)
 
 
-def htReplenishCycle():
-    pending = [team for team in DA_TEAMS
-               if not htIsFilled(team) and getEventID(team) in SECOND_HALF_START_TIMES]
-    if not pending:
-        return
+def _refreshBetfairSessionForCatalogue():
+    """Refresh the Betfair session at most once per cooldown window."""
+    global LAST_CATALOGUE_SESSION_REFRESH
+    now_epoch = time.time()
+    if now_epoch - LAST_CATALOGUE_SESSION_REFRESH < CATALOGUE_SESSION_REFRESH_COOLDOWN_SECONDS:
+        return False
 
-    # During a pending HT boundary, watch other half-time events too so a new
-    # SecondHalfKickOff is not missed. Prices are requested only for a new or
-    # already-pending HT boundary, never for every watched market.
-    watch = {getEventID(team): team for team in pending if getEventID(team)}
-    for team in htFocusEntries():
-        event_id = getEventID(team)
-        if event_id:
-            watch[event_id] = team
+    # Set the timestamp before login so a failed login cannot be hammered every
+    # 30-second collector cycle.
+    LAST_CATALOGUE_SESSION_REFRESH = now_epoch
+    try:
+        token = betfairAPI.getNewSessionToken()
+        if not token:
+            return False
+        setter = getattr(betfairAPI, '_setSessionToken', None)
+        if not callable(setter):
+            return False
+        setter(token)
+        print('Betfair session refreshed')
+        return True
+    except Exception as err:
+        print(f'Betfair session refresh failed: {err}')
+        return False
 
-    timelines = requestTrackedTimelines(list(watch.keys())) if watch else []
-    live_signals = detectLivePhaseSignals(timelines)
-    rememberTimelineStates(timelines, live_signals)
-    processFinished(timelines)
-    processSecondHalfStarts(timelines, live_signals)
-    retryPendingHT(timelines)
-    applyPendingHT(timelines)
-    persistState()
 
+def _catalogueCallWithRecovery(call, *args, **kwargs):
+    """Run one catalogue call, refreshing an unusable session once if needed.
+
+    A genuine no-match response is [] and is therefore considered successful.
+    The legacy betfairAPI wrapper returns {} after HTTP/API failures, including
+    the repeated 400 response seen after some Windows hibernation resumes.
+    """
+    try:
+        result = call(*args, **kwargs)
+    except Exception:
+        result = None
+
+    if _catalogueResultValid(result):
+        return result, True
+
+    if _refreshBetfairSessionForCatalogue():
+        try:
+            result = call(*args, **kwargs)
+        except Exception:
+            result = None
+        if _catalogueResultValid(result):
+            return result, True
+
+    return [], False
+
+
+def _reportCatalogueAvailability(current_ok, near_ok):
+    """Print only state changes; do not spam every 30-second cycle."""
+    global CATALOGUE_API_UNAVAILABLE
+    unavailable = not current_ok or not near_ok
+    if unavailable and not CATALOGUE_API_UNAVAILABLE:
+        print('Betfair catalogue unavailable; retaining cached markets')
+    elif not unavailable and CATALOGUE_API_UNAVAILABLE:
+        print('Betfair catalogue recovered')
+    CATALOGUE_API_UNAVAILABLE = unavailable
+
+
+def routineCorruptRecoveryEntries(ko_entries, ht_entries, results):
+    """Routine pre-boundary samples stay on 30 seconds; fast recovery is boundary-only."""
+    return []
 
 def main():
     global filename
 
-    current_catalogue = betfairAPI.getMarketCatalogueByEventTypeId(soccerEventTypeID) or []
-    near_start_catalogue = betfairAPI.getMarketCatalogueNearStartByEventTypeId(
+    current_catalogue, current_catalogue_ok = _catalogueCallWithRecovery(
+        betfairAPI.getMarketCatalogueByEventTypeId, soccerEventTypeID
+    )
+    near_start_catalogue, near_start_catalogue_ok = _catalogueCallWithRecovery(
+        betfairAPI.getMarketCatalogueNearStartByEventTypeId,
         soccerEventTypeID,
-        minutes_before=KO_KEEP_AFTER_SCHEDULE_MINUTES,
+        minutes_before=KO_CATALOGUE_LOOKBACK_MINUTES,
         minutes_after=KO_FOCUS_BEFORE_MINUTES
-    ) or []
-    refreshCatalogueCaches(current_catalogue, near_start_catalogue)
+    )
+    _reportCatalogueAvailability(current_catalogue_ok, near_start_catalogue_ok)
+
+    # Never interpret a failed API call as an authoritative empty catalogue.
+    # Keep the previous cache so tracked matches survive a transient session or
+    # network failure and continue normally once the API recovers.
+    if not current_catalogue_ok:
+        current_catalogue = list(CURRENT_INPLAY_CATALOGUE.values())
+    if not near_start_catalogue_ok:
+        near_start_catalogue = list(NEAR_START_CATALOGUE.values())
+
+    refreshCatalogueCaches(current_catalogue, near_start_catalogue, current_catalogue_ok)
     scheduleFinalRecoveryJobs()
 
     event_ids = watchedEventIDs(current_catalogue, near_start_catalogue)
@@ -3712,34 +4797,42 @@ def main():
     rememberTimelineStates(timelines, live_signals)
     processFinished(timelines)
     recordFinalRecoveryAttempts(event_ids)
-    archiveExhaustedClosedRecoveries()
     processKOEvents(timelines)
-    processCatalogueKickOffFallback(current_catalogue)
-    processSecondHalfStarts(timelines, live_signals)
-    retryPendingHT(timelines)
+    catalogue_ko_activated = processCatalogueKickOffFallback(current_catalogue)
 
-    # Ordinary 30-second price sampling only. KO starts three minutes before the
-    # scheduled start and keeps the latest valid pre-KO book. Half-time recess
-    # likewise keeps the latest valid reference without any 10-second price loop.
+    # A NEWLY_ACTIVE catalogue transition is an actual KO whiff, not merely a
+    # note for later.  Service its T+0 website-price request in this same cycle
+    # before any routine PRE work.  This is deliberately non-blocking: if the
+    # book is poor the normal +15..+90 scheduler takes over.
+    if catalogue_ko_activated:
+        runBoundaryRecoveryTick(refresh_timelines=False)
+
+    # Routine pre-boundary insurance uses only the 30-second heartbeat: KO from
+    # scheduled -2 minutes to scheduled KO, HT from FirstHalfEnd +13 minutes.
     ko_entries = koStandardPriceEntries()
     ht_entries = htRecessPriceEntries()
-    minute_entries = minuteFocusEntries()
-    standard_by_market = {}
-    for entry in ko_entries + ht_entries + minute_entries:
+    boundary_by_market = {}
+    for entry in ko_entries + ht_entries:
         market_id = getMarketID(entry)
         if market_id:
-            standard_by_market[market_id] = entry
-    standard_entries = list(standard_by_market.values())
-
-    results = pollEntries(standard_entries, aggressive=False, point='30S') if standard_entries else {}
+            boundary_by_market[market_id] = entry
+    boundary_entries = list(boundary_by_market.values())
+    results = pollBoundaryEntriesRaw(boundary_entries, point='30S_RAW') if boundary_entries else {}
     rememberLatestPreKO(ko_entries, results)
     rememberLatestHTRecess(ht_entries, results)
 
-    # KO is frozen from the first clean post-KO snapshot on this 30-second cycle.
-    # If the timeline already shows an early goal/red card, the saved pre-KO book
-    # is used instead. Only unusually large pre->post movement is logged.
+    # KickOff / SecondHalfKickOff trigger the same POST capture mechanism.
+    # T+0 is immediate; only unresolved markets are then retried at +15 seconds,
+    # up to six retries / 90 seconds total.  PRE remains ordinary 30-second work.
     applyPendingKO(timelines, results)
-    applyPendingHT(timelines, results)
+    processSecondHalfStarts(timelines, live_signals, results)
+    runBoundaryRecoveryTick(refresh_timelines=False)
+
+    # Any optional minute-window feature remains legacy/independent of KO/HT.
+    minute_entries = minuteFocusEntries()
+    if minute_entries:
+        pollEntries(minute_entries, point='WIN')
+    standard_entries = boundary_entries + minute_entries
     closeDueMatchDays()
     persistState()
 
@@ -3760,10 +4853,15 @@ def stopAndSave(signum=None, frame=None):
 
 
 def runCollector():
+    print(f"Leftia_AI v{LEFTIA_AI_VERSION}")
     restored = restoreState()
     if restored:
         finaliseRestoredMatchesFromState()
-        scheduleFinalRecoveryJobs(restored=True)
+
+    # A machine may wake after sleeping through the 04:00 day boundary. Close
+    # every expired day before any fresh current-day collection starts.
+    closeDueMatchDays(restored=restored)
+    scheduleFinalRecoveryJobs(restored=restored)
     persistState(force=True)
 
     try:
@@ -3772,27 +4870,31 @@ def runCollector():
     except Exception:
         pass
 
-    anchor = time.monotonic()
-    slot = 0
+    # Normal discovery/timeline/PRE work remains on a 30-second heartbeat.
+    # Only unresolved POST capture wakes at 15-second intervals, and all due
+    # markets are serviced together: no per-match sleep loops or blocking.
+    next_normal = time.time()
+
     while True:
         try:
-            target = anchor + (slot * INTERMEDIATE_INTERVAL)
-            now = time.monotonic()
-            if target > now:
-                time.sleep(target - now)
-            elif now - target >= INTERMEDIATE_INTERVAL:
-                # Never fire a burst of catch-up requests after a slow or stalled
-                # cycle. Skip missed opportunities and resume at the next slot.
-                slot = int((now - anchor) // INTERMEDIATE_INTERVAL) + 1
-                target = anchor + (slot * INTERMEDIATE_INTERVAL)
-                time.sleep(max(target - time.monotonic(), 0))
+            now_epoch = time.time()
 
-            if slot % (STANDARD_INTERVAL // INTERMEDIATE_INTERVAL) == 0:
+            # After hibernation do one normal cycle, never replay missed slots.
+            if now_epoch >= next_normal:
                 main()
-            elif intermediateWorkNeeded():
-                focusedCycle()
+                next_normal = time.time() + STANDARD_INTERVAL
+                continue
 
-            slot += 1
+            recovery_due = _activeBoundaryRecoveryDue(now_epoch)
+            if recovery_due is not None and recovery_due <= now_epoch:
+                runBoundaryRecoveryTick(refresh_timelines=True)
+                continue
+
+            wake_at = next_normal
+            if recovery_due is not None:
+                wake_at = min(wake_at, recovery_due)
+            time.sleep(max(0.05, wake_at - time.time()))
+
         except KeyboardInterrupt:
             try:
                 persistState(force=True)
@@ -3806,10 +4908,10 @@ def runCollector():
                 persistState(force=True)
             except Exception as dump_err:
                 print(f"State save error: {dump_err}")
-            time.sleep(NORMAL_DELAY)
-            anchor = time.monotonic()
-            slot = 0
-
+            # Brief backoff only. A transient exception must not silence every
+            # boundary market for another full 30-second heartbeat.
+            time.sleep(min(5, NORMAL_DELAY))
+            next_normal = time.time()
 
 if __name__ == '__main__':
     runCollector()
